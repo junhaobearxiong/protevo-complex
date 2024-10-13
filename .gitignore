@@ -1,0 +1,6 @@
+data/
+notebooks/
+bash_scripts/
+__pycache__/
+setup.py
+*.egg-info
