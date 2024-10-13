@@ -16,11 +16,16 @@ import hashlib
 import os
 import re
 from typing import Optional
+import cherryml.phylogeny_estimation
 import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
+from joblib import Parallel, delayed
+import cherryml
+from functools import partial
 
 from ppievo.io import write_msa
+from ppievo.utils import amino_acids, gap_character
 
 MAIN_DIR = "/home/bear/projects/protein-evolution/"
 DATA_DIR = os.path.join(MAIN_DIR, "data/local_data/human_ppi")
@@ -140,7 +145,7 @@ def get_protein_lengths(
         raise ValueError("The paired MSA file does not start with the expected header.")
 
 
-def subsample_and_split_pair_msa(
+def _subsample_and_split_pair_msa(
     pair_msa_path: str,
     num_sequences: Optional[int],
     output_pair_msa_dir: str,
@@ -226,6 +231,17 @@ def subsample_and_split_pair_msa(
                     [c.upper() for i, c in enumerate(protein_seq) if i >= protein1_len]
                 )
 
+            # Replace unknown characters with gap
+            pair_seq = "".join(
+                [c if c in amino_acids else gap_character for c in pair_seq]
+            )
+            unpair_seq1 = "".join(
+                [c if c in amino_acids else gap_character for c in unpair_seq1]
+            )
+            unpair_seq2 = "".join(
+                [c if c in amino_acids else gap_character for c in unpair_seq2]
+            )
+
             # Add record to each MSA
             pair_msa.append((protein_id, pair_seq))
             unpair_msa1.append((protein_id, unpair_seq1))
@@ -279,7 +295,7 @@ def subsample_and_split_pair_msa(
     )
 
 
-def train_test_split_interaction_pairs(
+def _train_test_split_interaction_pairs(
     num_train_pairs: int = 1000, num_test_pairs: int = 1000, seed: int = 42
 ):
     """
@@ -409,6 +425,7 @@ def train_test_split_subsample_all_msas(
     num_test_pairs: int = 1000,
     return_full_length_sequences: bool = False,
     seed: int = 42,
+    num_processes: int = 1,
 ):
     """
     Split data into train and testing pairs
@@ -416,7 +433,7 @@ def train_test_split_subsample_all_msas(
     paired and unpaired msas separatedly
     """
     # Split all pairs into train and test
-    train_pairs, test_pairs = train_test_split_interaction_pairs(
+    train_pairs, test_pairs = _train_test_split_interaction_pairs(
         num_train_pairs=num_train_pairs, num_test_pairs=num_test_pairs, seed=seed
     )
     if not os.path.exists(output_msa_dir):
@@ -430,23 +447,107 @@ def train_test_split_subsample_all_msas(
     for dirname in output_dirnames.values():
         os.makedirs(dirname, exist_ok=True)
 
-    # TODO: parallelize
-    for protein1, protein2 in tqdm(train_pairs):
-        pair_name = f"{protein1}_{protein2}"
-        subsample_and_split_pair_msa(
-            pair_msa_path=os.path.join(input_msa_dir, pair_name + ".fas"),
+    Parallel(n_jobs=num_processes)(
+        delayed(_subsample_and_split_pair_msa)(
+            pair_msa_path=os.path.join(input_msa_dir, f"{protein1}_{protein2}.fas"),
             num_sequences=num_sequences,
             output_pair_msa_dir=output_dirnames["train_pair_msa"],
             output_unpair_msa_dir=output_dirnames["train_unpair_msa"],
             return_full_length_unaligned_sequences=return_full_length_sequences,
         )
+        for protein1, protein2 in tqdm(train_pairs)
+    )
 
-    for protein1, protein2 in tqdm(test_pairs):
-        pair_name = f"{protein1}_{protein2}"
-        subsample_and_split_pair_msa(
-            pair_msa_path=os.path.join(input_msa_dir, pair_name + ".fas"),
+    Parallel(n_jobs=num_processes)(
+        delayed(_subsample_and_split_pair_msa)(
+            pair_msa_path=os.path.join(input_msa_dir, f"{protein1}_{protein2}.fas"),
             num_sequences=num_sequences,
             output_pair_msa_dir=output_dirnames["test_pair_msa"],
             output_unpair_msa_dir=output_dirnames["test_unpair_msa"],
             return_full_length_unaligned_sequences=return_full_length_sequences,
         )
+        for protein1, protein2 in tqdm(test_pairs)
+    )
+    return output_dirnames.values()
+
+
+def estimate_trees(
+    msa_dir: str,
+    output_dir: str,
+    num_rate_categories: int = 1,
+    rate_matrix_path: str = "data/rate_matrices/wag.txt",
+    num_processes: int = 1,
+):
+    """
+    Estimate trees for all MSAs in a directory
+    """
+    # Get the file names of all MSAs
+    msa_names = [
+        file.split(".txt")[0] for file in os.listdir(msa_dir) if file.endswith(".txt")
+    ]
+
+    # Create output directories
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    output_tree_dir = os.path.join(output_dir, "output_tree_dir")
+    output_site_rates_dir = os.path.join(output_dir, "output_site_rates_dir")
+    output_likelihood_dir = os.path.join(output_dir, "output_likelihood__dir")
+    if not os.path.exists(output_tree_dir):
+        os.makedirs(output_tree_dir)
+    if not os.path.exists(output_site_rates_dir):
+        os.makedirs(output_site_rates_dir)
+    if not os.path.exists(output_likelihood_dir):
+        os.makedirs(output_likelihood_dir)
+
+    # FUTURE NOTE: since we wish to examine the intermediate outputs
+    # we don't used the cached function
+    fast_tree_bin = (
+        cherryml.phylogeny_estimation._fast_tree._install_fast_tree_and_return_bin_path()
+    )
+    Parallel(n_jobs=num_processes)(
+        delayed(
+            cherryml.phylogeny_estimation._fast_tree.run_fast_tree_with_custom_rate_matrix
+        )(
+            msa_path=os.path.join(msa_dir, f"{msa_name}.txt"),
+            family=msa_name,
+            rate_matrix_path=rate_matrix_path,
+            num_rate_categories=num_rate_categories,
+            output_tree_dir=output_tree_dir,
+            output_site_rates_dir=output_site_rates_dir,
+            output_likelihood_dir=output_likelihood_dir,
+            extra_command_line_args="",
+            fast_tree_bin=fast_tree_bin,
+        )
+        for msa_name in tqdm(msa_names)
+    )
+
+
+def main():
+    num_processes = 16
+
+    # # Train test split and subsample the MSAs
+    # msa_dirs = train_test_split_subsample_all_msas(
+    #     input_msa_dir=os.path.join(DATA_DIR, "pair_msas"),
+    #     output_msa_dir=os.path.join(DATA_DIR, "cache", "subsampled_msas"),
+    #     num_processes=num_processes,
+    # )
+
+    # Estimate trees on the unpair MSAs
+    msa_parent_dir = os.path.join(DATA_DIR, "cache", "subsampled_msas")
+    msa_dirs = {
+        "train": os.path.join(msa_parent_dir, "train", "unpair"),
+        "test": os.path.join(msa_parent_dir, "test", "unpair"),
+    }
+    tree_parent_dir = os.path.join(DATA_DIR, "cache", "fast_tree")
+    tree_dirs = {
+        "train": os.path.join(tree_parent_dir, "train"),
+        "test": os.path.join(tree_parent_dir, "test"),
+    }
+    for name, msa_dir in msa_dirs.items():
+        estimate_trees(
+            msa_dir=msa_dir, output_dir=tree_dirs[name], num_processes=num_processes
+        )
+
+
+if __name__ == "__main__":
+    main()

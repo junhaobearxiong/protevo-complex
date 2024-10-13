@@ -4,3 +4,4 @@ bash_scripts/
 __pycache__/
 setup.py
 *.egg-info
+tmp/
