@@ -13,12 +13,10 @@ then use the species information to pair the individual MSAs
 """
 
 import warnings
-
-warnings.simplefilter(action="ignore", category=FutureWarning)
-
 import hashlib
 import os
 import re
+import pandas as pd
 from typing import Optional
 import cherryml.phylogeny_estimation
 import numpy as np
@@ -30,8 +28,6 @@ from functools import partial
 
 from ppievo.io import (
     write_msa,
-    read_fasta,
-    write_dict,
     read_dict,
     Tree,
     get_leaf_distance,
@@ -57,27 +53,6 @@ def get_all_interacting_pairs(pdb_dir=os.path.join(DATA_DIR, "PDBs")):
             interacting_pairs.add(tuple(sorted((protein1, protein2))))
 
     return list(interacting_pairs)
-
-
-def _write_pair_msa_num_sequences(
-    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msas"),
-    output_path: str = os.path.join(
-        DATA_DIR, "cache/metadata/pair_msa_num_sequences.json"
-    ),
-) -> dict:
-    """
-    Get the number of sequences in all pair MSAs.
-    Only need to run once
-    """
-    all_pairs = get_all_interacting_pairs()
-    num_sequences = {}
-    for protein1, protein2 in tqdm(all_pairs):
-        name = f"{protein1}_{protein2}"
-        msa_path = os.path.join(pair_msa_dir, f"{name}.fas")
-        msa = dict(read_fasta(msa_path))
-        num_sequences[name] = len(msa)
-    write_dict(num_sequences, output_path)
-    return num_sequences
 
 
 def _subsample_and_split_pair_msa(
@@ -300,8 +275,12 @@ def _train_test_split_interaction_pairs(
     num_test_pairs: int = 1000,
     seed: int = 42,
     min_num_sequences: Optional[int] = 100,
+    max_vertebrates_proportion: Optional[float] = None,
     pair_msa_num_sequences_path: Optional[str] = os.path.join(
         DATA_DIR, "cache/metadata/pair_msa_num_sequences.json"
+    ),
+    pair_msa_species_stats_path: Optional[str] = os.path.join(
+        DATA_DIR, "cache/metadata/pair_msa_species_stats.csv"
     ),
 ):
     """
@@ -316,6 +295,9 @@ def _train_test_split_interaction_pairs(
     num_test_pairs (int): The desired number of pairs in the test set. Default is 1000.
     seed (int): Random seed for reproducibility. Default is 42.
     min_num_sequences (int): Minimum number of sequences in the pair MSAs. Default is 100
+    max_vertebrates_proportion (float): Maximum proportion of sequences in the
+        pair MSAs that are vertebrates. Default is None (no filtering)
+        Smaller values means more diverse but potentially less sequences
 
     Returns:
     tuple: Two lists of tuples, (train_pairs, test_pairs), where each tuple is a protein pair.
@@ -343,6 +325,22 @@ def _train_test_split_interaction_pairs(
         ]
         print(
             f"{len(all_pairs)} protein pairs left after filtering out pair MSAs with < {min_num_sequences} sequences"
+        )
+
+    if max_vertebrates_proportion is not None:
+        pair_msa_species_stats = pd.read_csv(pair_msa_species_stats_path)
+        pair_msa_species_stats = pair_msa_species_stats[
+            ["pair_name", "vertebrate_proportion"]
+        ].set_index("pair_name")
+        all_pairs = [
+            (protein1, protein2)
+            for protein1, protein2 in all_pairs
+            if pair_msa_species_stats.loc[f"{protein1}_{protein2}"].iloc[0]
+            <= max_vertebrates_proportion
+        ]
+        print(
+            f"{len(all_pairs)} protein pairs left after filtering out pair MSAs with > \
+            {max_vertebrates_proportion * 100}% vertebrate sequences"
         )
 
     # Build the graph
@@ -449,6 +447,7 @@ def train_test_split_subsample_all_msas(
     num_processes: int = 1,
     sequence_id_filtering: float = 1.0,
     sequence_id_filter_on_pair: bool = True,
+    max_vertebrates_proportion: Optional[float] = None,
 ):
     """
     Split data into train and testing pairs
@@ -461,6 +460,7 @@ def train_test_split_subsample_all_msas(
         num_test_pairs=num_test_pairs,
         seed=seed,
         min_num_sequences=min_num_sequences,
+        max_vertebrates_proportion=max_vertebrates_proportion,
     )
     if not os.path.exists(output_msa_dir):
         os.makedirs(output_msa_dir)
@@ -703,18 +703,19 @@ def extract_transitions(
 
 
 def main():
-    num_processes = 16
+    # Specify script params
+    num_processes = 32
     seq_id = 0.9
-    seq_id_int = int(seq_id * 100)
-    msa_parent_dir = os.path.join(
-        DATA_DIR, "cache", f"subsampled_msas-seq_id_{seq_id_int}_pair"
+    seq_id_filter_on_pair = True
+    max_vertebrates_proportion = 0.7
+    suffix = (
+        f"seq_id_{int(seq_id * 100)}_pair-vert_{int(max_vertebrates_proportion * 100)}"
     )
-    tree_parent_dir = os.path.join(
-        DATA_DIR, "cache", f"fast_tree-seq_id_{seq_id_int}_pair"
-    )
-    transition_parent_dir = os.path.join(
-        DATA_DIR, "cache", f"transitions-seq_id_{seq_id_int}_pair"
-    )
+    warnings.simplefilter(action="ignore", category=FutureWarning)
+
+    msa_parent_dir = os.path.join(DATA_DIR, "cache", f"subsampled_msas-{suffix}")
+    tree_parent_dir = os.path.join(DATA_DIR, "cache", f"fast_tree-{suffix}")
+    transition_parent_dir = os.path.join(DATA_DIR, "cache", f"transitions-{suffix}")
     msa_dirs = {
         "train": os.path.join(msa_parent_dir, "train", "unpair"),
         "test": os.path.join(msa_parent_dir, "test", "unpair"),
@@ -735,11 +736,12 @@ def main():
         output_msa_dir=msa_parent_dir,
         max_num_sequences=1024,
         min_num_sequences=500,
+        max_vertebrates_proportion=max_vertebrates_proportion,
         num_train_pairs=1000,
         num_test_pairs=1000,
         num_processes=num_processes,
         sequence_id_filtering=seq_id,
-        sequence_id_filter_on_pair=True,
+        sequence_id_filter_on_pair=seq_id_filter_on_pair,
     )
 
     # Estimate trees on the unpair MSAs
