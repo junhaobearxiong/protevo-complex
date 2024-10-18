@@ -12,6 +12,10 @@ To construct pair MSAs, we identify all interacting pairs by the name of the PDB
 then use the species information to pair the individual MSAs
 """
 
+import warnings
+
+warnings.simplefilter(action="ignore", category=FutureWarning)
+
 import hashlib
 import os
 import re
@@ -24,11 +28,18 @@ from joblib import Parallel, delayed
 import cherryml
 from functools import partial
 
-from ppievo.io import write_msa
-from ppievo.utils import amino_acids, gap_character
-
-MAIN_DIR = "/home/bear/projects/protein-evolution/"
-DATA_DIR = os.path.join(MAIN_DIR, "data/local_data/human_ppi")
+from ppievo.io import (
+    write_msa,
+    read_fasta,
+    write_dict,
+    read_dict,
+    Tree,
+    get_leaf_distance,
+    read_msa_index_with_genome_id,
+    read_tree,
+    write_transitions,
+)
+from ppievo.utils import amino_acids, gap_character, seq_identity, DATA_DIR
 
 
 def get_all_interacting_pairs(pdb_dir=os.path.join(DATA_DIR, "PDBs")):
@@ -48,109 +59,35 @@ def get_all_interacting_pairs(pdb_dir=os.path.join(DATA_DIR, "PDBs")):
     return list(interacting_pairs)
 
 
-def read_fasta(filename):
+def _write_pair_msa_num_sequences(
+    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msas"),
+    output_path: str = os.path.join(
+        DATA_DIR, "cache/metadata/pair_msa_num_sequences.json"
+    ),
+) -> dict:
     """
-    Simple helper to read fasta file
+    Get the number of sequences in all pair MSAs.
+    Only need to run once
     """
-    with open(filename) as f:
-        header, sequence = "", ""
-        for line in f:
-            line = line.strip()
-            if line.startswith(">"):
-                if header and sequence:
-                    yield (header, sequence)
-                header, sequence = line[1:], ""
-            else:
-                sequence += line
-        if header and sequence:
-            yield (header, sequence)
-
-
-def construct_pair_msa(
-    protein1,
-    protein2,
-    output_dir=os.path.join(DATA_DIR, "pair_msas"),
-    msa_dir=os.path.join(DATA_DIR, "humanPPI_MSA/MSA"),
-):
-    """
-    Function to construct pair MSA from the individual MSAs of two proteins
-    This is modified from https://colab.research.google.com/drive/1suhoIB5q6xn0APFHJE8c1eMiCuv9gCk_
-
-    Note:
-    1. This function is simple because the individual MSAs already have the paralogs filtered out
-        "All predicted protein sequences were aligned to their human orthologs, if available,
-        and we used reciprocal best-hit criteria (36) to distinguish orthologs from paralogs."
-    """
-    # Read sequences for both proteins
-    seqs1 = dict(read_fasta(os.path.join(msa_dir, f"{protein1}.fas")))
-    seqs2 = dict(read_fasta(os.path.join(msa_dir, f"{protein2}.fas")))
-
-    # Find common taxa
-    common_taxa = set(seqs1.keys()) & set(seqs2.keys())
-
-    # Write paired MSA
-    output_file = os.path.join(output_dir, f"{protein1}_{protein2}.fas")
-    with open(output_file, "w") as f:
-        # Write header
-        f.write(
-            f"#{len(next(iter(seqs1.values())))},{len(next(iter(seqs2.values())))}\t1,1\n"
-        )
-        f.write(f">{protein1}\t{protein2}\n")
-        f.write(f"{next(iter(seqs1.values()))}{next(iter(seqs2.values()))}\n")
-
-        # Write paired sequences
-        for taxon in common_taxa:
-            if taxon != "query":  # Exclude query sequence
-                # Header is taxon
-                f.write(f">{taxon}\n")
-                f.write(f"{seqs1[taxon]}{seqs2[taxon]}\n")
-
-
-def get_protein_lengths(
-    protein1, protein2, pair_msa_dir=os.path.join(DATA_DIR, "pair_msas")
-):
-    """
-    Function to get the lengths of two proteins from their paired MSA file.
-
-    Args:
-    protein1 (str): Name of the first protein
-    protein2 (str): Name of the second protein
-    pair_msa_dir (str): Directory containing the paired MSA files
-
-    Returns:
-    tuple: Lengths of protein1 and protein2 as integers
-    """
-
-    # Construct the filename
-    filename = os.path.join(pair_msa_dir, f"{protein1}_{protein2}.fas")
-
-    # Check if the file exists
-    if not os.path.exists(filename):
-        raise FileNotFoundError(
-            f"Paired MSA file for {protein1} and {protein2} not found."
-        )
-
-    # Read the first line of the file
-    with open(filename, "r") as f:
-        first_line = f.readline().strip()
-
-    # Extract the lengths
-    if first_line.startswith("#"):
-        lengths = first_line[1:].split("\t")[0].split(",")
-        if len(lengths) == 2:
-            return tuple(map(int, lengths))
-        else:
-            raise ValueError("Unexpected format in the header of the paired MSA file.")
-    else:
-        raise ValueError("The paired MSA file does not start with the expected header.")
+    all_pairs = get_all_interacting_pairs()
+    num_sequences = {}
+    for protein1, protein2 in tqdm(all_pairs):
+        name = f"{protein1}_{protein2}"
+        msa_path = os.path.join(pair_msa_dir, f"{name}.fas")
+        msa = dict(read_fasta(msa_path))
+        num_sequences[name] = len(msa)
+    write_dict(num_sequences, output_path)
+    return num_sequences
 
 
 def _subsample_and_split_pair_msa(
     pair_msa_path: str,
-    num_sequences: Optional[int],
+    max_num_sequences: Optional[int],
     output_pair_msa_dir: str,
     output_unpair_msa_dir: str,
     return_full_length_unaligned_sequences: bool = False,
+    sequence_id_filtering: float = 1.0,
+    sequence_id_filter_on_pair: bool = True,
 ):
     """
     Subsample sequences in an paired MSA, also split the subsampled pair MSA
@@ -160,6 +97,10 @@ def _subsample_and_split_pair_msa(
     full-length, unaligned sequences will be returned. (In particular,
     insertions wrt the original sequence will be retained and uppercased,
     and gaps will be removed from all sequences.)
+
+    If `sequence_id_filter_on_pair=True`, then the sequence identity filtering
+    if done on the pair sequenece, otherwise it is done separately for each protein
+    and only pair that passes the filter for each protein is kept
     """
     if not os.path.exists(pair_msa_path):
         raise FileNotFoundError(f"MSA file {pair_msa_path} does not exist!")
@@ -167,6 +108,8 @@ def _subsample_and_split_pair_msa(
     # Read MSA
     # type: list[tuple[str, str]]
     pair_msa, unpair_msa1, unpair_msa2 = [], [], []
+    # Keep track of unique sequences and only include unique sequences
+    pair_seqs_unique = []
     with open(pair_msa_path) as file:
         lines = list(file)
         n_lines = len(lines)
@@ -179,7 +122,9 @@ def _subsample_and_split_pair_msa(
         pair_name = f"{protein1}_{protein2}"
         for i in range(1, n_lines, 2):
             if not lines[i][0] == ">":
-                raise Exception("Protein ID line should start with '>'")
+                print(f"Protein ID line should start with '>'")
+                print(f"File: {pair_msa_path}, skipping line {i}: {lines[i]}")
+                continue
             # Protein ID contains species identifier
             # e.g. 'GCA_016906955.1 Phacochoerus:Suidae:Artiodactyla:Mammalia:Chordata'
             protein_id = lines[i][1:].strip()
@@ -242,10 +187,12 @@ def _subsample_and_split_pair_msa(
                 [c if c in amino_acids else gap_character for c in unpair_seq2]
             )
 
-            # Add record to each MSA
-            pair_msa.append((protein_id, pair_seq))
-            unpair_msa1.append((protein_id, unpair_seq1))
-            unpair_msa2.append((protein_id, unpair_seq2))
+            # Add record to each MSA if the pair sequence doesn't already exist
+            if pair_seq not in pair_seqs_unique:
+                pair_seqs_unique.append(pair_seq)
+                pair_msa.append((protein_id, pair_seq))
+                unpair_msa1.append((protein_id, unpair_seq1))
+                unpair_msa2.append((protein_id, unpair_seq2))
 
         # Check that all sequences in the MSA have the same length.
         if not return_full_length_unaligned_sequences:
@@ -268,16 +215,69 @@ def _subsample_and_split_pair_msa(
     )
     rng = np.random.default_rng(family_int_hash)
     nseqs = len(pair_msa)
-    if num_sequences is not None:
-        max_seqs = min(nseqs, num_sequences)
+
+    if max_num_sequences is not None and sequence_id_filtering < 1:
+        # Subsample and ensure the concatenated sequence have sequence id < sequence_id_filtering
+        # Implement filtering
+        filtered_indices = [0]  # Always include the query sequence
+        # Shuffle indices to randomize selection
+        candidate_indices = list(range(1, nseqs))
+        rng.shuffle(candidate_indices)
+        for idx in candidate_indices:
+            if len(filtered_indices) >= max_num_sequences:
+                break
+            if sequence_id_filter_on_pair:
+                # Perform sequence identity filtering on pair sequence
+                candidate_seq = pair_msa[idx][1]
+                # Check identity with query and all previously selected sequences
+                pass_filter = all(
+                    [
+                        seq_identity(candidate_seq, pair_msa[i][1])
+                        <= sequence_id_filtering
+                        for i in filtered_indices
+                    ]
+                )
+                if pass_filter:
+                    filtered_indices.append(idx)
+            else:
+                # Perform sequence identity filtering on unpair sequences
+                candidate_seq1 = unpair_msa1[idx][1]
+                candidate_seq2 = unpair_msa2[idx][1]
+                pass_filter_seq1 = all(
+                    [
+                        seq_identity(candidate_seq1, unpair_msa1[i][1])
+                        <= sequence_id_filtering
+                        for i in filtered_indices
+                    ]
+                )
+                pass_filter_seq2 = all(
+                    [
+                        seq_identity(candidate_seq2, unpair_msa2[i][1])
+                        <= sequence_id_filtering
+                        for i in filtered_indices
+                    ]
+                )
+                if pass_filter_seq1 and pass_filter_seq2:
+                    filtered_indices.append(idx)
+
+        seqs_to_keep = sorted(filtered_indices)
+        if len(seqs_to_keep) != max_num_sequences:
+            print(
+                f"Only have {len(seqs_to_keep)} for pair MSA={pair_msa_path} with seq id filter={sequence_id_filtering}"
+            )
+    elif max_num_sequences is not None:
+        max_seqs = min(nseqs, max_num_sequences)
         # Ensure query sequence is always included
         seqs_to_keep = [0] + list(
             rng.choice(range(1, nseqs, 1), size=max_seqs - 1, replace=False)
         )
         seqs_to_keep = sorted(seqs_to_keep)
-        pair_msa = [pair_msa[i] for i in seqs_to_keep]
-        unpair_msa1 = [unpair_msa1[i] for i in seqs_to_keep]
-        unpair_msa2 = [unpair_msa2[i] for i in seqs_to_keep]
+    else:
+        seqs_to_keep = range(nseqs)
+
+    pair_msa = [pair_msa[i] for i in seqs_to_keep]
+    unpair_msa1 = [unpair_msa1[i] for i in seqs_to_keep]
+    unpair_msa2 = [unpair_msa2[i] for i in seqs_to_keep]
 
     # Note: this function sorts the rows by the sequence name
     # so the query sequence might not be the first row
@@ -296,7 +296,13 @@ def _subsample_and_split_pair_msa(
 
 
 def _train_test_split_interaction_pairs(
-    num_train_pairs: int = 1000, num_test_pairs: int = 1000, seed: int = 42
+    num_train_pairs: int = 1000,
+    num_test_pairs: int = 1000,
+    seed: int = 42,
+    min_num_sequences: Optional[int] = 100,
+    pair_msa_num_sequences_path: Optional[str] = os.path.join(
+        DATA_DIR, "cache/metadata/pair_msa_num_sequences.json"
+    ),
 ):
     """
     Split protein interaction pairs into train and test sets, respecting the interaction structure.
@@ -309,6 +315,7 @@ def _train_test_split_interaction_pairs(
     num_train_pairs (int): The desired number of pairs in the train set. Default is 1000.
     num_test_pairs (int): The desired number of pairs in the test set. Default is 1000.
     seed (int): Random seed for reproducibility. Default is 42.
+    min_num_sequences (int): Minimum number of sequences in the pair MSAs. Default is 100
 
     Returns:
     tuple: Two lists of tuples, (train_pairs, test_pairs), where each tuple is a protein pair.
@@ -325,6 +332,18 @@ def _train_test_split_interaction_pairs(
 
     all_pairs = get_all_interacting_pairs()
     rng = np.random.default_rng(seed)
+
+    # Filter out any pair whose pair MSA is too shallow
+    if min_num_sequences is not None:
+        pair_msa_num_sequences = read_dict(pair_msa_num_sequences_path)
+        all_pairs = [
+            (protein1, protein2)
+            for protein1, protein2 in all_pairs
+            if pair_msa_num_sequences[f"{protein1}_{protein2}"] >= min_num_sequences
+        ]
+        print(
+            f"{len(all_pairs)} protein pairs left after filtering out pair MSAs with < {min_num_sequences} sequences"
+        )
 
     # Build the graph
     graph = defaultdict(set)
@@ -389,6 +408,7 @@ def _train_test_split_interaction_pairs(
             "Not enough interaction pairs to satisfy the requested split sizes."
         )
 
+    _test_train_test_split_interaction_pairs(train_pairs, test_pairs)
     return train_pairs, test_pairs
 
 
@@ -420,12 +440,15 @@ def _test_train_test_split_interaction_pairs(train_pairs, test_pairs):
 def train_test_split_subsample_all_msas(
     input_msa_dir: str,
     output_msa_dir: str,
-    num_sequences: int = 1024,
+    max_num_sequences: int = 1024,
+    min_num_sequences: int = 500,
     num_train_pairs: int = 1000,
     num_test_pairs: int = 1000,
     return_full_length_sequences: bool = False,
     seed: int = 42,
     num_processes: int = 1,
+    sequence_id_filtering: float = 1.0,
+    sequence_id_filter_on_pair: bool = True,
 ):
     """
     Split data into train and testing pairs
@@ -434,7 +457,10 @@ def train_test_split_subsample_all_msas(
     """
     # Split all pairs into train and test
     train_pairs, test_pairs = _train_test_split_interaction_pairs(
-        num_train_pairs=num_train_pairs, num_test_pairs=num_test_pairs, seed=seed
+        num_train_pairs=num_train_pairs,
+        num_test_pairs=num_test_pairs,
+        seed=seed,
+        min_num_sequences=min_num_sequences,
     )
     if not os.path.exists(output_msa_dir):
         os.makedirs(output_msa_dir)
@@ -450,25 +476,29 @@ def train_test_split_subsample_all_msas(
     Parallel(n_jobs=num_processes)(
         delayed(_subsample_and_split_pair_msa)(
             pair_msa_path=os.path.join(input_msa_dir, f"{protein1}_{protein2}.fas"),
-            num_sequences=num_sequences,
+            max_num_sequences=max_num_sequences,
             output_pair_msa_dir=output_dirnames["train_pair_msa"],
             output_unpair_msa_dir=output_dirnames["train_unpair_msa"],
             return_full_length_unaligned_sequences=return_full_length_sequences,
+            sequence_id_filtering=sequence_id_filtering,
+            sequence_id_filter_on_pair=sequence_id_filter_on_pair,
         )
         for protein1, protein2 in tqdm(train_pairs)
     )
 
-    Parallel(n_jobs=num_processes)(
-        delayed(_subsample_and_split_pair_msa)(
-            pair_msa_path=os.path.join(input_msa_dir, f"{protein1}_{protein2}.fas"),
-            num_sequences=num_sequences,
-            output_pair_msa_dir=output_dirnames["test_pair_msa"],
-            output_unpair_msa_dir=output_dirnames["test_unpair_msa"],
-            return_full_length_unaligned_sequences=return_full_length_sequences,
-        )
-        for protein1, protein2 in tqdm(test_pairs)
-    )
-    return output_dirnames.values()
+    # Parallel(n_jobs=num_processes)(
+    #     delayed(_subsample_and_split_pair_msa)(
+    #         pair_msa_path=os.path.join(input_msa_dir, f"{protein1}_{protein2}.fas"),
+    #         max_num_sequences=max_num_sequences,
+    #         output_pair_msa_dir=output_dirnames["test_pair_msa"],
+    #         output_unpair_msa_dir=output_dirnames["test_unpair_msa"],
+    #         return_full_length_unaligned_sequences=return_full_length_sequences,
+    #         sequence_id_filtering=sequence_id_filtering,
+    #         sequence_id_filter_on_pair=sequence_id_filter_on_pair,
+    #     )
+    #     for protein1, protein2 in tqdm(test_pairs)
+    # )
+    return output_dirnames
 
 
 def estimate_trees(
@@ -491,7 +521,7 @@ def estimate_trees(
         os.makedirs(output_dir)
     output_tree_dir = os.path.join(output_dir, "output_tree_dir")
     output_site_rates_dir = os.path.join(output_dir, "output_site_rates_dir")
-    output_likelihood_dir = os.path.join(output_dir, "output_likelihood__dir")
+    output_likelihood_dir = os.path.join(output_dir, "output_likelihood_dir")
     if not os.path.exists(output_tree_dir):
         os.makedirs(output_tree_dir)
     if not os.path.exists(output_site_rates_dir):
@@ -522,31 +552,238 @@ def estimate_trees(
     )
 
 
+def extract_pair_transitions_from_gene_trees(
+    tree_x: Tree,
+    tree_y: Tree,
+    msa_x: dict[str, str],
+    msa_y: dict[str, str],
+    include_gaps: bool = True,
+) -> list[tuple[str, str, float]]:
+    """
+    Extract transitions of a protein pairs from the gene trees.
+
+    Suppose we have two proteins x and y, we pick cherries from the tree of y
+    then extract the corresponding transitions in the tree of x
+    The transitions come from all (recursively picked) cherries in the tree of y,
+    and are bidirectional, so that if (y1, y2, t) is a transition, then also is
+    (y2, y1, t).
+
+    Whether gaps (assumed to be "-") are included or not is determined by
+    `include_gaps`.
+    """
+    total_pairs = []
+    transitions = []
+
+    def dfs(node) -> Optional[tuple[int, float]]:
+        """
+        Pair up leaves under me.
+
+        Return a single unpaired leaf and its distance, it such exists.
+        """
+        if tree_y.is_leaf(node):
+            return (node, 0.0)
+        unmatched_leaves_under = []
+        distances_under = []
+        for child, branch_length in tree_y.children(node):
+            maybe_unmatched_leaf, maybe_distance = dfs(child)
+            if maybe_unmatched_leaf is not None:
+                assert maybe_distance is not None
+                unmatched_leaves_under.append(maybe_unmatched_leaf)
+                distances_under.append(maybe_distance + branch_length)
+        assert len(unmatched_leaves_under) == len(distances_under)
+        index = 0
+
+        while index + 1 <= len(unmatched_leaves_under) - 1:
+            total_pairs.append(1)
+            (leaf_1, branch_length_1), (leaf_2, branch_length_2) = (
+                (unmatched_leaves_under[index], distances_under[index]),
+                (
+                    unmatched_leaves_under[index + 1],
+                    distances_under[index + 1],
+                ),
+            )
+
+            # Extract y1, y2 from protein y
+            leaf_seq_y1, leaf_seq_y2 = msa_y[leaf_1], msa_y[leaf_2]
+            distance_y = branch_length_1 + branch_length_2
+            # Extract x1, x2 from the protein x corresponding to the same leaves
+            leaf_seq_x1, leaf_seq_x2 = msa_x[leaf_1], msa_x[leaf_2]
+            # Estimate the distance between y1 and y2 in the tree of y
+            distance_x = get_leaf_distance(tree=tree_x, leaf1=leaf_1, leaf2=leaf_2)
+            transitions.append(
+                (
+                    leaf_seq_x1,
+                    leaf_seq_y1,
+                    leaf_seq_x2,
+                    leaf_seq_y2,
+                    distance_x,
+                    distance_y,
+                )
+            )  # Note: gaps will be removed later
+            transitions.append(
+                (
+                    leaf_seq_x2,
+                    leaf_seq_y2,
+                    leaf_seq_x1,
+                    leaf_seq_y1,
+                    distance_x,
+                    distance_y,
+                )
+            )  # Note: gaps will be removed later
+            index += 2
+        if len(unmatched_leaves_under) % 2 == 0:
+            return (None, None)
+        else:
+            return (unmatched_leaves_under[-1], distances_under[-1])
+
+    dfs(tree_x.root())
+    if not include_gaps:
+        # Remove gaps from all sequences.
+        def remove_gaps(seq: str) -> str:
+            return "".join([char for char in seq if char != "-"])
+
+        transitions = [
+            (remove_gaps(x1), remove_gaps(y1), remove_gaps(x2), remove_gaps(y2), tx, ty)
+            for (x1, y1, x2, y2, tx, ty) in transitions
+        ]
+    assert len(total_pairs) == int(len(tree_x.leaves()) / 2)
+    assert 2 * len(total_pairs) == len(transitions)
+    return transitions
+
+
+def extract_transitions(
+    msa_dir: str,
+    tree_dir: str,
+    pair_names: list[str],
+    num_processes: int,
+    include_gaps: bool = True,
+    output_transitions_dir: Optional[str] = None,
+):
+
+    def _extract_transition_for_pair(pair_name: str):
+        protein1, protein2 = pair_name.split("_")
+
+        # Read in both unpair MSA for a protein pair
+        msa1 = read_msa_index_with_genome_id(
+            os.path.join(msa_dir, f"{pair_name}-{protein1}.txt")
+        )
+        msa2 = read_msa_index_with_genome_id(
+            os.path.join(msa_dir, f"{pair_name}-{protein2}.txt")
+        )
+        # Read the tree built for one of them
+        tree1 = read_tree(os.path.join(tree_dir, f"{pair_name}-{protein1}.txt"))
+        tree2 = read_tree(os.path.join(tree_dir, f"{pair_name}-{protein2}.txt"))
+        # Extract transitions
+        transitions = extract_pair_transitions_from_gene_trees(
+            tree_x=tree1,
+            tree_y=tree2,
+            msa_x=msa1,
+            msa_y=msa2,
+            include_gaps=include_gaps,
+        )
+        # list[(x1, y1, x2, y2, tx, ty)]
+        transitions = sorted(
+            transitions,
+            key=lambda transition: (
+                transition[5],
+                transition[4],
+                transition[3],
+                transition[2],
+                transition[1],
+                transition[0],
+            ),
+        )
+        transitions_path = os.path.join(output_transitions_dir, f"{pair_name}.txt")
+        write_transitions(transitions=transitions, transitions_path=transitions_path)
+
+    Parallel(n_jobs=num_processes)(
+        delayed(_extract_transition_for_pair)(pair_name=pair_name)
+        for pair_name in tqdm(pair_names)
+    )
+
+
 def main():
     num_processes = 16
-
-    # # Train test split and subsample the MSAs
-    # msa_dirs = train_test_split_subsample_all_msas(
-    #     input_msa_dir=os.path.join(DATA_DIR, "pair_msas"),
-    #     output_msa_dir=os.path.join(DATA_DIR, "cache", "subsampled_msas"),
-    #     num_processes=num_processes,
-    # )
-
-    # Estimate trees on the unpair MSAs
-    msa_parent_dir = os.path.join(DATA_DIR, "cache", "subsampled_msas")
+    seq_id = 0.9
+    seq_id_int = int(seq_id * 100)
+    msa_parent_dir = os.path.join(
+        DATA_DIR, "cache", f"subsampled_msas-seq_id_{seq_id_int}_pair"
+    )
+    tree_parent_dir = os.path.join(
+        DATA_DIR, "cache", f"fast_tree-seq_id_{seq_id_int}_pair"
+    )
+    transition_parent_dir = os.path.join(
+        DATA_DIR, "cache", f"transitions-seq_id_{seq_id_int}_pair"
+    )
     msa_dirs = {
         "train": os.path.join(msa_parent_dir, "train", "unpair"),
         "test": os.path.join(msa_parent_dir, "test", "unpair"),
     }
-    tree_parent_dir = os.path.join(DATA_DIR, "cache", "fast_tree")
     tree_dirs = {
         "train": os.path.join(tree_parent_dir, "train"),
         "test": os.path.join(tree_parent_dir, "test"),
     }
-    for name, msa_dir in msa_dirs.items():
-        estimate_trees(
-            msa_dir=msa_dir, output_dir=tree_dirs[name], num_processes=num_processes
-        )
+    transition_dirs = {
+        "train": os.path.join(transition_parent_dir, "train"),
+        "test": os.path.join(transition_parent_dir, "test"),
+    }
+
+    # Train test split and subsample the MSAs
+    print("Train test split and subsampling MSAs...")
+    train_test_split_subsample_all_msas(
+        input_msa_dir=os.path.join(DATA_DIR, "pair_msas"),
+        output_msa_dir=msa_parent_dir,
+        max_num_sequences=1024,
+        min_num_sequences=500,
+        num_train_pairs=1000,
+        num_test_pairs=1000,
+        num_processes=num_processes,
+        sequence_id_filtering=seq_id,
+        sequence_id_filter_on_pair=True,
+    )
+
+    # Estimate trees on the unpair MSAs
+    print("Estimating trees...")
+    estimate_trees(
+        msa_dir=msa_dirs["train"],
+        output_dir=tree_dirs["train"],
+        num_processes=num_processes,
+    )
+    estimate_trees(
+        msa_dir=msa_dirs["test"],
+        output_dir=tree_dirs["test"],
+        num_processes=num_processes,
+    )
+
+    # Extract paired transitions from trees
+    print("Extracting transitions...")
+    # Read pair names from the subsampled pair MSA dirs
+    train_pair_names = [
+        file.split(".txt")[0]
+        for file in os.listdir(os.path.join(msa_parent_dir, "train", "pair"))
+        if file.endswith(".txt")
+    ]
+    extract_transitions(
+        msa_dir=msa_dirs["train"],
+        tree_dir=os.path.join(tree_dirs["train"], "output_tree_dir"),
+        pair_names=train_pair_names,
+        num_processes=num_processes,
+        include_gaps=True,
+        output_transitions_dir=transition_dirs["train"],
+    )
+    # test_pair_names = [
+    #     file.split(".txt")[0]
+    #     for file in os.listdir(os.path.join(msa_parent_dir, "test", "pair"))
+    #     if file.endswith(".txt")
+    # ]
+    # extract_transitions(
+    #     msa_dir=msa_dirs["test"],
+    #     tree_dir=os.path.join(tree_dirs["test"], "output_tree_dir"),
+    #     pair_names=test_pair_names,
+    #     num_processes=num_processes,
+    #     include_gaps=True,
+    #     output_transitions_dir=transition_dirs["test"],
+    # )
 
 
 if __name__ == "__main__":

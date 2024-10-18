@@ -1,3 +1,5 @@
+import os
+
 amino_acids = (
     "A",
     "R",
@@ -22,3 +24,7 @@ amino_acids = (
 )
 
 gap_character = "-"
+
+# Paths
+MAIN_DIR = "/home/bear/projects/protein-evolution/"
+DATA_DIR = os.path.join(MAIN_DIR, "data/local_data/human_ppi")

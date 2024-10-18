@@ -16,7 +16,12 @@ from cherryml.io import (
     write_tree,
 )
 
-from ._transitions import TransitionsType, read_transitions, write_transitions
+from ._transitions import (
+    TransitionsType,
+    read_transitions,
+    write_transitions,
+    get_leaf_distance,
+)
 from ._transitions_log_likelihood import (
     TransitionsLogLikelihoodType,
     read_transitions_log_likelihood,
@@ -25,6 +30,13 @@ from ._transitions_log_likelihood import (
 from ._transitions_log_likelihood_per_site import (
     read_transitions_log_likelihood_per_site,
     write_transitions_log_likelihood_per_site,
+)
+from ._msa import (
+    read_dict,
+    read_fasta,
+    write_dict,
+    read_msa_index_with_genome_id,
+    get_protein_lengths,
 )
 
 __all__ = [
@@ -46,11 +58,15 @@ __all__ = [
     "TransitionsType",
     "read_transitions",
     "write_transitions",
+    "get_leaf_distance",
     "TransitionsLogLikelihoodType",
     "read_transitions_log_likelihood",
     "write_transitions_log_likelihood",
     "read_transitions_log_likelihood_per_site",
     "write_transitions_log_likelihood_per_site",
-    "read_distance_map",
-    "write_distance_map",
+    "read_dict",
+    "read_fasta",
+    "write_dict",
+    "read_msa_index_with_genome_id",
+    "get_protein_lengths",
 ]
