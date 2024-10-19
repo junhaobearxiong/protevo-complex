@@ -115,8 +115,10 @@ class PairMSACollator:
         for b in batch:
             enc_seqs.append([b["x1_toks"], b["y1_toks"]])
             dec_seqs.append([b["x2_toks"], b["y2_toks"]])
-            enc_lengths.append([b["x1_len"], b["y1_len"]])
-            dec_lengths.append([b["x2_len"], b["y2_len"]])
+            # Each sequence in the encoder inputs have <cls> and <eos>
+            enc_lengths.append([b["x1_len"] + 2, b["y1_len"] + 2])
+            # Each sequence in the decoder input has <.> or <eos>
+            dec_lengths.append([b["x2_len"] + 1, b["y2_len"] + 1])
             distances.append([b["tx"], b["ty"]])
 
         # Create masked x1 and y1 for MLM loss#
@@ -187,7 +189,7 @@ class PairMSACollator:
             attn_mask_dec_lengths[i, : len(l)] = torch.tensor(l)
 
         # Store distance tx and ty
-        distances_tensor = torch.zeros_like(enc_targets)
+        distances_tensor = torch.zeros_like(enc_targets, dtype=torch.float32)
         for i, d in enumerate(distances):
             distances_tensor[i, : len(d)] = torch.tensor(d)
 
