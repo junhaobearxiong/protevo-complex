@@ -34,6 +34,7 @@ from ppievo.io import (
     read_msa_index_with_genome_id,
     read_tree,
     write_transitions,
+    construct_pair_msa,
 )
 from ppievo.utils import amino_acids, gap_character, seq_identity, DATA_DIR
 
@@ -53,6 +54,23 @@ def get_all_interacting_pairs(pdb_dir=os.path.join(DATA_DIR, "PDBs")):
             interacting_pairs.add(tuple(sorted((protein1, protein2))))
 
     return list(interacting_pairs)
+
+
+def construct_all_pair_msa(
+    output_dir=os.path.join(DATA_DIR, "pair_msa"),
+    msa_dir=os.path.join(DATA_DIR, "humanPPI_MSA/MSA"),
+):
+    """
+    Construct pair MSAs for all interacting pairs
+    """
+    all_pairs = get_all_interacting_pairs()
+    print(f"Writing all pair MSAs for {len(all_pairs)} pairs to {output_dir}")
+    Parallel(n_jobs=-1)(
+        delayed(construct_pair_msa)(
+            protein1=protein1, protein2=protein2, output_dir=output_dir, msa_dir=msa_dir
+        )
+        for protein1, protein2 in tqdm(all_pairs)
+    )
 
 
 def _subsample_and_split_pair_msa(
@@ -703,76 +721,78 @@ def extract_transitions(
 
 
 def main():
-    # Specify script params
-    num_processes = 32
-    seq_id = 0.9
-    seq_id_filter_on_pair = True
-    max_vertebrates_proportion = 0.7
-    suffix = (
-        f"seq_id_{int(seq_id * 100)}_pair-vert_{int(max_vertebrates_proportion * 100)}"
-    )
-    warnings.simplefilter(action="ignore", category=FutureWarning)
+    construct_all_pair_msa()
 
-    msa_parent_dir = os.path.join(DATA_DIR, "cache", f"subsampled_msas-{suffix}")
-    tree_parent_dir = os.path.join(DATA_DIR, "cache", f"fast_tree-{suffix}")
-    transition_parent_dir = os.path.join(DATA_DIR, "cache", f"transitions-{suffix}")
-    msa_dirs = {
-        "train": os.path.join(msa_parent_dir, "train", "unpair"),
-        "test": os.path.join(msa_parent_dir, "test", "unpair"),
-    }
-    tree_dirs = {
-        "train": os.path.join(tree_parent_dir, "train"),
-        "test": os.path.join(tree_parent_dir, "test"),
-    }
-    transition_dirs = {
-        "train": os.path.join(transition_parent_dir, "train"),
-        "test": os.path.join(transition_parent_dir, "test"),
-    }
+    # # Specify script params
+    # num_processes = 32
+    # seq_id = 0.9
+    # seq_id_filter_on_pair = True
+    # max_vertebrates_proportion = 0.7
+    # suffix = (
+    #     f"seq_id_{int(seq_id * 100)}_pair-vert_{int(max_vertebrates_proportion * 100)}"
+    # )
+    # warnings.simplefilter(action="ignore", category=FutureWarning)
 
-    # Train test split and subsample the MSAs
-    print("Train test split and subsampling MSAs...")
-    train_test_split_subsample_all_msas(
-        input_msa_dir=os.path.join(DATA_DIR, "pair_msas"),
-        output_msa_dir=msa_parent_dir,
-        max_num_sequences=1024,
-        min_num_sequences=500,
-        max_vertebrates_proportion=max_vertebrates_proportion,
-        num_train_pairs=1000,
-        num_test_pairs=1000,
-        num_processes=num_processes,
-        sequence_id_filtering=seq_id,
-        sequence_id_filter_on_pair=seq_id_filter_on_pair,
-    )
+    # msa_parent_dir = os.path.join(DATA_DIR, "cache", f"subsampled_msas-{suffix}")
+    # tree_parent_dir = os.path.join(DATA_DIR, "cache", f"fast_tree-{suffix}")
+    # transition_parent_dir = os.path.join(DATA_DIR, "cache", f"transitions-{suffix}")
+    # msa_dirs = {
+    #     "train": os.path.join(msa_parent_dir, "train", "unpair"),
+    #     "test": os.path.join(msa_parent_dir, "test", "unpair"),
+    # }
+    # tree_dirs = {
+    #     "train": os.path.join(tree_parent_dir, "train"),
+    #     "test": os.path.join(tree_parent_dir, "test"),
+    # }
+    # transition_dirs = {
+    #     "train": os.path.join(transition_parent_dir, "train"),
+    #     "test": os.path.join(transition_parent_dir, "test"),
+    # }
 
-    # Estimate trees on the unpair MSAs
-    print("Estimating trees...")
-    estimate_trees(
-        msa_dir=msa_dirs["train"],
-        output_dir=tree_dirs["train"],
-        num_processes=num_processes,
-    )
-    estimate_trees(
-        msa_dir=msa_dirs["test"],
-        output_dir=tree_dirs["test"],
-        num_processes=num_processes,
-    )
+    # # Train test split and subsample the MSAs
+    # print("Train test split and subsampling MSAs...")
+    # train_test_split_subsample_all_msas(
+    #     input_msa_dir=os.path.join(DATA_DIR, "pair_msa"),
+    #     output_msa_dir=msa_parent_dir,
+    #     max_num_sequences=1024,
+    #     min_num_sequences=500,
+    #     max_vertebrates_proportion=max_vertebrates_proportion,
+    #     num_train_pairs=1000,
+    #     num_test_pairs=1000,
+    #     num_processes=num_processes,
+    #     sequence_id_filtering=seq_id,
+    #     sequence_id_filter_on_pair=seq_id_filter_on_pair,
+    # )
 
-    # Extract paired transitions from trees
-    print("Extracting transitions...")
-    # Read pair names from the subsampled pair MSA dirs
-    train_pair_names = [
-        file.split(".txt")[0]
-        for file in os.listdir(os.path.join(msa_parent_dir, "train", "pair"))
-        if file.endswith(".txt")
-    ]
-    extract_transitions(
-        msa_dir=msa_dirs["train"],
-        tree_dir=os.path.join(tree_dirs["train"], "output_tree_dir"),
-        pair_names=train_pair_names,
-        num_processes=num_processes,
-        include_gaps=True,
-        output_transitions_dir=transition_dirs["train"],
-    )
+    # # Estimate trees on the unpair MSAs
+    # print("Estimating trees...")
+    # estimate_trees(
+    #     msa_dir=msa_dirs["train"],
+    #     output_dir=tree_dirs["train"],
+    #     num_processes=num_processes,
+    # )
+    # estimate_trees(
+    #     msa_dir=msa_dirs["test"],
+    #     output_dir=tree_dirs["test"],
+    #     num_processes=num_processes,
+    # )
+
+    # # Extract paired transitions from trees
+    # print("Extracting transitions...")
+    # # Read pair names from the subsampled pair MSA dirs
+    # train_pair_names = [
+    #     file.split(".txt")[0]
+    #     for file in os.listdir(os.path.join(msa_parent_dir, "train", "pair"))
+    #     if file.endswith(".txt")
+    # ]
+    # extract_transitions(
+    #     msa_dir=msa_dirs["train"],
+    #     tree_dir=os.path.join(tree_dirs["train"], "output_tree_dir"),
+    #     pair_names=train_pair_names,
+    #     num_processes=num_processes,
+    #     include_gaps=True,
+    #     output_transitions_dir=transition_dirs["train"],
+    # )
     # test_pair_names = [
     #     file.split(".txt")[0]
     #     for file in os.listdir(os.path.join(msa_parent_dir, "test", "pair"))

@@ -1,6 +1,7 @@
 import json
 import os
-
+from joblib import Parallel, delayed
+from tqdm import tqdm
 from ppievo.io import read_msa
 from ppievo.utils import DATA_DIR
 
@@ -38,7 +39,7 @@ def read_fasta(filename):
 def construct_pair_msa(
     protein1,
     protein2,
-    output_dir=os.path.join(DATA_DIR, "pair_msas"),
+    output_dir=os.path.join(DATA_DIR, "pair_msa"),
     msa_dir=os.path.join(DATA_DIR, "humanPPI_MSA/MSA"),
 ):
     """
@@ -76,7 +77,7 @@ def construct_pair_msa(
 
 
 def get_protein_lengths(
-    protein1, protein2, pair_msa_dir=os.path.join(DATA_DIR, "pair_msas")
+    protein1, protein2, pair_msa_dir=os.path.join(DATA_DIR, "pair_msa")
 ):
     """
     Function to get the lengths of two proteins from their paired MSA file.

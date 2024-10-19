@@ -37,6 +37,7 @@ from ._msa import (
     write_dict,
     read_msa_index_with_genome_id,
     get_protein_lengths,
+    construct_pair_msa,
 )
 
 __all__ = [
@@ -69,4 +70,5 @@ __all__ = [
     "write_dict",
     "read_msa_index_with_genome_id",
     "get_protein_lengths",
+    "construct_pair_msa",
 ]

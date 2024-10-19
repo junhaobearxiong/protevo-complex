@@ -9,7 +9,7 @@ from ppievo.datasets.human_ppi import get_all_interacting_pairs
 
 
 def _write_pair_msa_num_sequences(
-    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msas"),
+    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msa"),
     output_path: str = os.path.join(
         DATA_DIR, "cache/metadata/pair_msa_num_sequences.json"
     ),
@@ -29,7 +29,7 @@ def _write_pair_msa_num_sequences(
     return num_sequences
 
 
-def calc_msa_stats(pair_msa_dir=os.path.join(DATA_DIR, "pair_msas")):
+def calc_msa_stats(pair_msa_dir=os.path.join(DATA_DIR, "pair_msa")):
     msa_stats_df = []
     # Iterate over all MSA files
     all_pairs = get_all_interacting_pairs()
@@ -56,7 +56,7 @@ def calc_msa_stats(pair_msa_dir=os.path.join(DATA_DIR, "pair_msas")):
 
 
 def calc_species_stats(
-    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msas"),
+    pair_msa_dir: str = os.path.join(DATA_DIR, "pair_msa"),
     output_path: str = os.path.join(
         DATA_DIR, "cache/metadata/pair_msa_species_stats.csv"
     ),
