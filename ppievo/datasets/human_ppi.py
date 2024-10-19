@@ -24,7 +24,8 @@ from collections import defaultdict
 from tqdm import tqdm
 from joblib import Parallel, delayed
 import cherryml
-from functools import partial
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import connected_components
 
 from ppievo.io import (
     write_msa,
@@ -36,7 +37,13 @@ from ppievo.io import (
     write_transitions,
     construct_pair_msa,
 )
-from ppievo.utils import amino_acids, gap_character, seq_identity, DATA_DIR
+from ppievo.utils import (
+    DATA_DIR,
+    amino_acids,
+    gap_character,
+    seq_identity,
+    calculate_distance_matrix,
+)
 
 
 def get_all_interacting_pairs(pdb_dir=os.path.join(DATA_DIR, "PDBs")):
@@ -73,27 +80,15 @@ def construct_all_pair_msa(
     )
 
 
-def _subsample_and_split_pair_msa(
-    pair_msa_path: str,
-    max_num_sequences: Optional[int],
-    output_pair_msa_dir: str,
-    output_unpair_msa_dir: str,
+def _read_pair_msa(
+    pair_msa_path: int,
     return_full_length_unaligned_sequences: bool = False,
-    sequence_id_filtering: float = 1.0,
-    sequence_id_filter_on_pair: bool = True,
 ):
     """
-    Subsample sequences in an paired MSA, also split the subsampled pair MSA
-    into the unpaired MSAs and store these separately
-
-    If `return_full_length_unaligned_sequences=True`, then the original,
-    full-length, unaligned sequences will be returned. (In particular,
-    insertions wrt the original sequence will be retained and uppercased,
-    and gaps will be removed from all sequences.)
-
-    If `sequence_id_filter_on_pair=True`, then the sequence identity filtering
-    if done on the pair sequenece, otherwise it is done separately for each protein
-    and only pair that passes the filter for each protein is kept
+    Read in a pair MSA and return list of (id, sequence) tuples for
+    1) concatenated sequence of protein 1 and 2
+    2) sequence of protein 1
+    3) sequence of protein 2
     """
     if not os.path.exists(pair_msa_path):
         raise FileNotFoundError(f"MSA file {pair_msa_path} does not exist!")
@@ -109,10 +104,6 @@ def _subsample_and_split_pair_msa(
         # First line contain the length of the two alignments, indicates where the two MSAs were concatenated
         protein1_len = int(lines[0].split(",")[0].split("#")[1])
         # protein2_len = int(file_header.split(',')[1].split('\t')[0])
-        # Second line contains the name of the two proteins in the pairs
-        protein1 = lines[1][1:].split("\t")[0]
-        protein2 = lines[1][1:].split("\t")[1][:-1]
-        pair_name = f"{protein1}_{protein2}"
         for i in range(1, n_lines, 2):
             if not lines[i][0] == ">":
                 print(f"Protein ID line should start with '>'")
@@ -197,6 +188,187 @@ def _subsample_and_split_pair_msa(
                         f" {len(pair_msa[i + 1][1])})"
                     )
 
+    return pair_msa, unpair_msa1, unpair_msa2
+
+
+def _cluster_and_sample(
+    pair_msa: list[tuple[str, str]],
+    unpair_msa1: list[tuple[str, str]],
+    unpair_msa2: list[tuple[str, str]],
+    max_num_sequences: int,
+    sequence_id_filtering: float,
+    sequence_id_filter_on_pair: bool,
+    rng: np.random.Generator,
+) -> list[int]:
+    """
+    Cluster sequences in a pair MSA then subsample the sequences
+    If sequence_id_filter_on_pair is True, input should be the pair MSA
+    and the clustering is based on the sequence identity of concatenated sequences
+    Else, input should be two unpair MSAs and the clustering is done by
+    separately computing the sequence identity in each MSA, then average the
+    sequence identity
+    """
+
+    if sequence_id_filter_on_pair:
+        seqs = [seq for _, seq in pair_msa]
+        distance_matrix = calculate_distance_matrix(seqs)
+    else:
+        assert len(unpair_msa1) == len(
+            unpair_msa2
+        ), "msa1 and msa2 should have the same number of sequences"
+        seqs1 = [seq for _, seq in unpair_msa1]
+        seqs2 = [seq for _, seq in unpair_msa2]
+        distance_matrix1 = calculate_distance_matrix(seqs1)
+        distance_matrix2 = calculate_distance_matrix(seqs2)
+        distance_matrix = (distance_matrix1 + distance_matrix2) / 2
+
+    nseqs = len(pair_msa)
+    # Two sequences are connected if their distance < 1 - seq id threshold
+    adjacency_matrix = (distance_matrix < 1 - sequence_id_filtering).astype(int)
+    # Convert to sparse matrix for efficiency
+    sparse_graph = csr_matrix(adjacency_matrix)
+    # Perform connected components analysis
+    n_components, clusters = connected_components(
+        csgraph=sparse_graph, directed=False, return_labels=True
+    )
+
+    # Always include the query sequence
+    sampled_indices = [0]
+    cluster_representatives = {clusters[0]: [0]}
+    # Shuffle the remaining indices
+    candidate_indices = list(range(1, nseqs))
+    rng.shuffle(candidate_indices)
+
+    # First pass: select one representative from each cluster
+    for i in candidate_indices:
+        if clusters[i] not in cluster_representatives:
+            cluster_representatives[clusters[i]] = [i]
+            sampled_indices.append(i)
+        else:
+            cluster_representatives[clusters[i]].append(i)
+
+        if len(sampled_indices) >= max_num_sequences:
+            break
+
+    # If we still need more sequences, sample from the clusters
+    if len(sampled_indices) < max_num_sequences:
+        cluster_sizes = [
+            len(representatives) for representatives in cluster_representatives.values()
+        ]
+
+        # Calculate sampling probabilities based on cluster sizes
+        sampling_probs = np.array(cluster_sizes) / sum(cluster_sizes)
+
+        while len(sampled_indices) < max_num_sequences:
+            # Choose a cluster based on its size
+            chosen_cluster = rng.choice(
+                list(cluster_representatives.keys()), p=sampling_probs
+            )
+
+            # Choose a random sequence from the chosen cluster that hasn't been sampled yet
+            available_indices = [
+                idx
+                for idx in cluster_representatives[chosen_cluster]
+                if idx not in sampled_indices
+            ]
+            if available_indices:
+                chosen_index = rng.choice(available_indices)
+                sampled_indices.append(chosen_index)
+
+            # If this cluster is exhausted, set its probability to 0 and renormalize
+            if not available_indices:
+                sampling_probs[
+                    list(cluster_representatives.keys()).index(chosen_cluster)
+                ] = 0
+                sampling_probs = sampling_probs / np.sum(sampling_probs)
+
+    return sampled_indices
+
+
+def _greedy_sample(
+    pair_msa: list[tuple[str, str]],
+    unpair_msa1: list[tuple[str, str]],
+    unpair_msa2: list[tuple[str, str]],
+    max_num_sequences: int,
+    sequence_id_filtering: float,
+    sequence_id_filter_on_pair: bool,
+    rng: np.random.Generator,
+) -> list[int]:
+    nseqs = len(pair_msa)
+    # Subsample and ensure the concatenated sequence have sequence id < sequence_id_filtering
+    filtered_indices = [0]  # Always include the query sequence
+    # Shuffle indices to randomize selection
+    candidate_indices = list(range(1, nseqs))
+    rng.shuffle(candidate_indices)
+    for idx in candidate_indices:
+        if len(filtered_indices) >= max_num_sequences:
+            break
+        if sequence_id_filter_on_pair:
+            # Perform sequence identity filtering on pair sequence
+            candidate_seq = pair_msa[idx][1]
+            # Check identity with query and all previously selected sequences
+            pass_filter = all(
+                [
+                    seq_identity(candidate_seq, pair_msa[i][1]) <= sequence_id_filtering
+                    for i in filtered_indices
+                ]
+            )
+            if pass_filter:
+                filtered_indices.append(idx)
+        else:
+            # Perform sequence identity filtering on unpair sequences
+            candidate_seq1 = unpair_msa1[idx][1]
+            candidate_seq2 = unpair_msa2[idx][1]
+            pass_filter_seq1 = all(
+                [
+                    seq_identity(candidate_seq1, unpair_msa1[i][1])
+                    <= sequence_id_filtering
+                    for i in filtered_indices
+                ]
+            )
+            pass_filter_seq2 = all(
+                [
+                    seq_identity(candidate_seq2, unpair_msa2[i][1])
+                    <= sequence_id_filtering
+                    for i in filtered_indices
+                ]
+            )
+            if pass_filter_seq1 and pass_filter_seq2:
+                filtered_indices.append(idx)
+
+    return filtered_indices
+
+
+def _subsample_and_split_pair_msa(
+    pair_msa_path: str,
+    max_num_sequences: Optional[int],
+    output_pair_msa_dir: str,
+    output_unpair_msa_dir: str,
+    return_full_length_unaligned_sequences: bool = False,
+    sequence_id_filtering: float = 1.0,
+    sequence_id_filter_on_pair: bool = True,
+):
+    """
+    Subsample sequences in an paired MSA, also split the subsampled pair MSA
+    into the unpaired MSAs and store these separately
+
+    If `return_full_length_unaligned_sequences=True`, then the original,
+    full-length, unaligned sequences will be returned. (In particular,
+    insertions wrt the original sequence will be retained and uppercased,
+    and gaps will be removed from all sequences.)
+
+    If `sequence_id_filter_on_pair=True`, then the sequence identity filtering
+    if done on the pair sequenece, otherwise it is done separately for each protein
+    and only pair that passes the filter for each protein is kept
+    """
+    pair_msa, unpair_msa1, unpair_msa2 = _read_pair_msa(
+        pair_msa_path=pair_msa_path,
+        return_full_length_unaligned_sequences=return_full_length_unaligned_sequences,
+    )
+    # The ID of the first entry of pair msa contains the name of the two proteins in the pairs
+    protein1 = pair_msa[0][0].split("\t")[0]
+    protein2 = pair_msa[0][0].split("\t")[1]
+    pair_name = f"{protein1}_{protein2}"
     # Subsample MSA
     # Sebastian's fancy way to get random seeds
     family_int_hash = (
@@ -210,50 +382,17 @@ def _subsample_and_split_pair_msa(
     nseqs = len(pair_msa)
 
     if max_num_sequences is not None and sequence_id_filtering < 1:
-        # Subsample and ensure the concatenated sequence have sequence id < sequence_id_filtering
-        # Implement filtering
-        filtered_indices = [0]  # Always include the query sequence
-        # Shuffle indices to randomize selection
-        candidate_indices = list(range(1, nseqs))
-        rng.shuffle(candidate_indices)
-        for idx in candidate_indices:
-            if len(filtered_indices) >= max_num_sequences:
-                break
-            if sequence_id_filter_on_pair:
-                # Perform sequence identity filtering on pair sequence
-                candidate_seq = pair_msa[idx][1]
-                # Check identity with query and all previously selected sequences
-                pass_filter = all(
-                    [
-                        seq_identity(candidate_seq, pair_msa[i][1])
-                        <= sequence_id_filtering
-                        for i in filtered_indices
-                    ]
-                )
-                if pass_filter:
-                    filtered_indices.append(idx)
-            else:
-                # Perform sequence identity filtering on unpair sequences
-                candidate_seq1 = unpair_msa1[idx][1]
-                candidate_seq2 = unpair_msa2[idx][1]
-                pass_filter_seq1 = all(
-                    [
-                        seq_identity(candidate_seq1, unpair_msa1[i][1])
-                        <= sequence_id_filtering
-                        for i in filtered_indices
-                    ]
-                )
-                pass_filter_seq2 = all(
-                    [
-                        seq_identity(candidate_seq2, unpair_msa2[i][1])
-                        <= sequence_id_filtering
-                        for i in filtered_indices
-                    ]
-                )
-                if pass_filter_seq1 and pass_filter_seq2:
-                    filtered_indices.append(idx)
-
-        seqs_to_keep = sorted(filtered_indices)
+        # Cluster sequences based on sequence identity then subsample sequences
+        sampled_indices = _greedy_sample(
+            pair_msa=pair_msa,
+            unpair_msa1=unpair_msa1,
+            unpair_msa2=unpair_msa2,
+            max_num_sequences=max_num_sequences,
+            sequence_id_filtering=sequence_id_filtering,
+            sequence_id_filter_on_pair=sequence_id_filter_on_pair,
+            rng=rng,
+        )
+        seqs_to_keep = sorted(sampled_indices)
         if len(seqs_to_keep) != max_num_sequences:
             print(
                 f"Only have {len(seqs_to_keep)} for pair MSA={pair_msa_path} with seq id filter={sequence_id_filtering}"
@@ -721,78 +860,76 @@ def extract_transitions(
 
 
 def main():
-    construct_all_pair_msa()
+    # Specify script params
+    num_processes = 16
+    seq_id = 0.9
+    seq_id_filter_on_pair = True
+    max_vertebrates_proportion = 0.7
+    suffix = (
+        f"seq_id_{int(seq_id * 100)}_pair-vert_{int(max_vertebrates_proportion * 100)}"
+    )
+    warnings.simplefilter(action="ignore", category=FutureWarning)
 
-    # # Specify script params
-    # num_processes = 32
-    # seq_id = 0.9
-    # seq_id_filter_on_pair = True
-    # max_vertebrates_proportion = 0.7
-    # suffix = (
-    #     f"seq_id_{int(seq_id * 100)}_pair-vert_{int(max_vertebrates_proportion * 100)}"
-    # )
-    # warnings.simplefilter(action="ignore", category=FutureWarning)
+    msa_parent_dir = os.path.join(DATA_DIR, "cache", f"subsampled_msas-{suffix}")
+    tree_parent_dir = os.path.join(DATA_DIR, "cache", f"fast_tree-{suffix}")
+    transition_parent_dir = os.path.join(DATA_DIR, "cache", f"transitions-{suffix}")
+    msa_dirs = {
+        "train": os.path.join(msa_parent_dir, "train", "unpair"),
+        "test": os.path.join(msa_parent_dir, "test", "unpair"),
+    }
+    tree_dirs = {
+        "train": os.path.join(tree_parent_dir, "train"),
+        "test": os.path.join(tree_parent_dir, "test"),
+    }
+    transition_dirs = {
+        "train": os.path.join(transition_parent_dir, "train"),
+        "test": os.path.join(transition_parent_dir, "test"),
+    }
 
-    # msa_parent_dir = os.path.join(DATA_DIR, "cache", f"subsampled_msas-{suffix}")
-    # tree_parent_dir = os.path.join(DATA_DIR, "cache", f"fast_tree-{suffix}")
-    # transition_parent_dir = os.path.join(DATA_DIR, "cache", f"transitions-{suffix}")
-    # msa_dirs = {
-    #     "train": os.path.join(msa_parent_dir, "train", "unpair"),
-    #     "test": os.path.join(msa_parent_dir, "test", "unpair"),
-    # }
-    # tree_dirs = {
-    #     "train": os.path.join(tree_parent_dir, "train"),
-    #     "test": os.path.join(tree_parent_dir, "test"),
-    # }
-    # transition_dirs = {
-    #     "train": os.path.join(transition_parent_dir, "train"),
-    #     "test": os.path.join(transition_parent_dir, "test"),
-    # }
+    # Train test split and subsample the MSAs
+    print("Train test split and subsampling MSAs...")
+    train_test_split_subsample_all_msas(
+        input_msa_dir=os.path.join(DATA_DIR, "pair_msa"),
+        output_msa_dir=msa_parent_dir,
+        max_num_sequences=1024,
+        min_num_sequences=500,
+        max_vertebrates_proportion=max_vertebrates_proportion,
+        num_train_pairs=1000,
+        num_test_pairs=1000,
+        num_processes=num_processes,
+        sequence_id_filtering=seq_id,
+        sequence_id_filter_on_pair=seq_id_filter_on_pair,
+    )
 
-    # # Train test split and subsample the MSAs
-    # print("Train test split and subsampling MSAs...")
-    # train_test_split_subsample_all_msas(
-    #     input_msa_dir=os.path.join(DATA_DIR, "pair_msa"),
-    #     output_msa_dir=msa_parent_dir,
-    #     max_num_sequences=1024,
-    #     min_num_sequences=500,
-    #     max_vertebrates_proportion=max_vertebrates_proportion,
-    #     num_train_pairs=1000,
-    #     num_test_pairs=1000,
-    #     num_processes=num_processes,
-    #     sequence_id_filtering=seq_id,
-    #     sequence_id_filter_on_pair=seq_id_filter_on_pair,
-    # )
-
-    # # Estimate trees on the unpair MSAs
-    # print("Estimating trees...")
-    # estimate_trees(
-    #     msa_dir=msa_dirs["train"],
-    #     output_dir=tree_dirs["train"],
-    #     num_processes=num_processes,
-    # )
+    # Estimate trees on the unpair MSAs
+    print("Estimating trees...")
+    estimate_trees(
+        msa_dir=msa_dirs["train"],
+        output_dir=tree_dirs["train"],
+        num_processes=num_processes,
+    )
     # estimate_trees(
     #     msa_dir=msa_dirs["test"],
     #     output_dir=tree_dirs["test"],
     #     num_processes=num_processes,
     # )
 
-    # # Extract paired transitions from trees
-    # print("Extracting transitions...")
-    # # Read pair names from the subsampled pair MSA dirs
-    # train_pair_names = [
-    #     file.split(".txt")[0]
-    #     for file in os.listdir(os.path.join(msa_parent_dir, "train", "pair"))
-    #     if file.endswith(".txt")
-    # ]
-    # extract_transitions(
-    #     msa_dir=msa_dirs["train"],
-    #     tree_dir=os.path.join(tree_dirs["train"], "output_tree_dir"),
-    #     pair_names=train_pair_names,
-    #     num_processes=num_processes,
-    #     include_gaps=True,
-    #     output_transitions_dir=transition_dirs["train"],
-    # )
+    # Extract paired transitions from trees
+    print("Extracting transitions...")
+    # Read pair names from the subsampled pair MSA dirs
+    train_pair_names = [
+        file.split(".txt")[0]
+        for file in os.listdir(os.path.join(msa_parent_dir, "train", "pair"))
+        if file.endswith(".txt")
+    ]
+    extract_transitions(
+        msa_dir=msa_dirs["train"],
+        tree_dir=os.path.join(tree_dirs["train"], "output_tree_dir"),
+        pair_names=train_pair_names,
+        num_processes=num_processes,
+        include_gaps=True,
+        output_transitions_dir=transition_dirs["train"],
+    )
     # test_pair_names = [
     #     file.split(".txt")[0]
     #     for file in os.listdir(os.path.join(msa_parent_dir, "test", "pair"))
