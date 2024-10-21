@@ -8,6 +8,9 @@ from esm.data import Alphabet
 from ppievo.io import read_transitions
 
 
+# TODO: filter out sequences that are too long
+# allow loading multiple families
+# https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/datasets/_torch_datasets.py#L154
 class PairMSADataset(Dataset):
     def __init__(self, pair_name: str, transitions_dir: str, vocab: Alphabet):
         """

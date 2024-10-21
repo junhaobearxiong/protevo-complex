@@ -51,7 +51,7 @@ class Pipet(nn.Module):
         self.use_esm_final_embed = use_esm_final_embed
 
         self.embed_tokens = nn.Embedding(len(vocab), embedding_dim)
-        if self.use_esm_input_embed is not None:
+        if self.use_esm_input_embed:
             if embedding_dim != esm_model.embed_tokens.embedding_dim:
                 raise ValueError(
                     f"embedding_dim needs to be same as esm embedding dim={esm_model.embed_tokens.embedding_dim}"
@@ -103,7 +103,7 @@ class Pipet(nn.Module):
         # Embed input tokens for decoder
         h_dec = self.embed_tokens(dec_in)
 
-        if self.use_esm_final_embed is not None:
+        if self.use_esm_final_embed:
             # Use the ESM final layer embedding for encoder inputs
             # Each sequence in encoder input is embedded separatedly
             # enc_attn_mask indicates the sequence boundary
@@ -131,6 +131,8 @@ class Pipet(nn.Module):
         return enc_logits, dec_logits
 
 
+# TODO: update to allow loading in pretrained ESM model
+# https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/models/_transformer.py#L1181
 class PipetModule(pl.LightningModule):
     """
     Lightning Module Wrapper around the Pipet Model
