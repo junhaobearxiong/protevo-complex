@@ -1,5 +1,3 @@
-from typing import List, Tuple
-
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -54,6 +52,10 @@ class Pipet(nn.Module):
 
         self.embed_tokens = nn.Embedding(len(vocab), embedding_dim)
         if self.use_esm_input_embed is not None:
+            if embedding_dim != esm_model.embed_tokens.embedding_dim:
+                raise ValueError(
+                    f"embedding_dim needs to be same as esm embedding dim={esm_model.embed_tokens.embedding_dim}"
+                )
             # Use ESM input embedding layer weights and freeze it
             self.embed_tokens.load_state_dict(esm_model.embed_tokens.state_dict())
             self.embed_tokens.requires_grad_(False)

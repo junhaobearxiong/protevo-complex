@@ -427,19 +427,149 @@ class MultiSequenceESMEmbed(nn.Module):
         self.esm = esm_model
         self.vocab = vocab
         self.esm.eval()
-        self.esm.requires_grad(False)
+        # Freeze ESM
+        self.esm.requires_grad_(False)
 
     def forward(self, x, attn_mask_in_length):
         """
         Compute ESM embedding separately for each sequence in the batch
-        Can probably use attn_mask to create a separate padding mask for each
-        sequence that turns all tokens besides those of this sequence to padding
-        ESM then deals with padding internally
-        Check it is okay for there to be <pad> before <cls> token
-        i.e. check how padding_mask is implemented
-        """
 
-        pass
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, seq_len)
+            attn_mask_in_length (torch.Tensor): Tensor of shape (batch_size, num_sequences) containing
+                the lengths of sequences in each batch. Non-zero values indicate the length of each sequence,
+                while zeros represent padding.
+        """
+        bsz, seq_len = x.shape
+        num_sequences = (attn_mask_in_length > 0).sum(dim=1)
+
+        # Assert that all batch elements have the same number of sequences
+        assert torch.all(
+            num_sequences == num_sequences[0]
+        ), "All batch elements must have the same number of sequences"
+
+        num_sequences = num_sequences[0].item()
+
+        # The embedding size is the shape of the last layer's layer norm
+        embed_size = self.esm.layers[-1].final_layer_norm.normalized_shape[0]
+        combined_embedding = torch.zeros(
+            (bsz, seq_len, embed_size), dtype=torch.float, device=x.device
+        )
+
+        for seq_idx in range(num_sequences):
+            # Create a copy of the input to avoid modifying the original
+            x_seq = x.clone()
+            # Set padding for the current sequence
+            for i in range(bsz):
+                lengths = attn_mask_in_length[i, :num_sequences]
+                start_idx = sum(lengths[:seq_idx])
+                end_idx = start_idx + lengths[seq_idx]
+                # Set padding before the sequence
+                if start_idx > 0:
+                    x_seq[i, :start_idx] = self.vocab.padding_idx
+                # Set padding after the sequence
+                if end_idx < seq_len:
+                    x_seq[i, end_idx:] = self.vocab.padding_idx
+
+            # Compute embeddings for the current sequence
+            with torch.no_grad():
+                output = self.esm(x_seq, repr_layers=[self.esm.num_layers])
+                embedding = output["representations"][self.esm.num_layers]
+
+            # Add the current sequence embedding to the combined embedding
+            # mask: Shape (B, L, 1)
+            mask = (x_seq != self.vocab.padding_idx).unsqueeze(-1)
+            combined_embedding += embedding * mask
+
+        return combined_embedding
+
+
+def _test_multi_sequence_esm_embed(esm_model, vocab, device=torch.device("cuda")):
+    """
+    Test the multi-sequence embedding produced the same outputs as if the
+    sequences are embedded separatedly
+    """
+
+    def esm_embed_seq(x):
+        output = esm_model(x, repr_layers=[esm_model.num_layers])
+        embedding = output["representations"][esm_model.num_layers]
+        return embedding
+
+    # Create input data
+    batch_size = 5
+    max_seq_len = 20
+    x = torch.full((batch_size, max_seq_len), vocab.padding_idx, device=device)
+    attn_mask_in_length = torch.zeros((batch_size, 10), dtype=torch.long, device=device)
+    start_tok_idx, end_tok_idx = 4, 10
+    atol = 1e-5  # absolute tolerance
+
+    # Fill in sequences
+    for i in range(batch_size):
+        seq1_len = torch.randint(
+            6, 10, (1,)
+        ).item()  # Random length between 3 and 5 (inclusive)
+        seq2_len = torch.randint(6, 10, (1,)).item()
+
+        # First sequence
+        x[i, 0] = vocab.cls_idx
+        x[i, 1 : seq1_len - 1] = torch.randint(
+            start_tok_idx, end_tok_idx, (seq1_len - 2,)
+        )
+        x[i, seq1_len - 1] = vocab.eos_idx
+
+        # Second sequence
+        x[i, seq1_len] = vocab.cls_idx
+        x[i, seq1_len + 1 : seq1_len + seq2_len - 1] = torch.randint(
+            start_tok_idx, end_tok_idx, (seq2_len - 2,)
+        )
+        x[i, seq1_len + seq2_len - 1] = vocab.eos_idx
+
+        attn_mask_in_length[i, 0] = seq1_len
+        attn_mask_in_length[i, 1] = seq2_len
+
+    # Embed the concat sequence
+    esm_embed_multiseq = MultiSequenceESMEmbed(esm_model=esm_model, vocab=vocab)
+    multiseq_embed = esm_embed_multiseq(x, attn_mask_in_length)
+
+    # Embed the sequences separately
+    max_seq1_len = attn_mask_in_length[:, 0].max().item()
+    max_seq2_len = attn_mask_in_length[:, 1].max().item()
+
+    # Prepare and embed first sequences
+    x_seq1 = torch.full((batch_size, max_seq1_len), vocab.padding_idx, device=device)
+    for i in range(batch_size):
+        seq1_len = attn_mask_in_length[i, 0]
+        x_seq1[i, :seq1_len] = x[i, :seq1_len]
+    seq1_embedding = esm_embed_seq(x_seq1)
+
+    # Prepare and embed second sequences
+    x_seq2 = torch.full((batch_size, max_seq2_len), vocab.padding_idx, device=device)
+    for i in range(batch_size):
+        seq1_len = attn_mask_in_length[i, 0]
+        seq2_len = attn_mask_in_length[i, 1]
+        x_seq2[i, :seq2_len] = x[i, seq1_len : seq1_len + seq2_len]
+    seq2_embedding = esm_embed_seq(x_seq2)
+
+    # Check if embeddings match for each sequence in each batch element separately
+    for i in range(batch_size):
+        seq1_len = attn_mask_in_length[i, 0]
+        seq2_len = attn_mask_in_length[i, 1]
+
+        if not torch.allclose(
+            multiseq_embed[i, :seq1_len], seq1_embedding[i, :seq1_len], atol=atol
+        ):
+            import pdb
+
+            pdb.set_trace()
+
+        assert torch.allclose(
+            multiseq_embed[i, :seq1_len], seq1_embedding[i, :seq1_len], atol=atol
+        ), f"Mismatch in sequence 1 for batch {i}"
+        assert torch.allclose(
+            multiseq_embed[i, seq1_len : seq1_len + seq2_len],
+            seq2_embedding[i, :seq2_len],
+            atol=atol,
+        ), f"Mismatch in sequence 2 for batch {i}"
 
 
 class EncoderLayer(nn.Module):
@@ -450,7 +580,7 @@ class EncoderLayer(nn.Module):
         ffn_embed_dim: int,
         dropout_p: float,
         layer_idx: Optional[int] = None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
 
@@ -516,7 +646,7 @@ class DecoderLayer(nn.Module):
         ffn_embed_dim: int,
         dropout_p: float,
         layer_idx: Optional[int] = None,
-        **kwargs
+        **kwargs,
     ):
         super().__init__()
 
