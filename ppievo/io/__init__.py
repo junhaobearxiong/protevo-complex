@@ -21,6 +21,7 @@ from ._transitions import (
     read_transitions,
     write_transitions,
     get_leaf_distance,
+    filter_transitions_by_protein_and_length,
 )
 from ._transitions_log_likelihood import (
     TransitionsLogLikelihoodType,
@@ -71,4 +72,5 @@ __all__ = [
     "read_msa_index_with_genome_id",
     "get_protein_lengths",
     "construct_pair_msa",
+    "filter_transitions_by_protein_and_length",
 ]

@@ -727,6 +727,9 @@ def extract_pair_transitions_from_gene_trees(
 
     Whether gaps (assumed to be "-") are included or not is determined by
     `include_gaps`.
+
+    FUTURE NOTE: we should probably run this function twice, once with protein1
+    as x and protein2 as y; and once with protein1 as y and protein2 as x.
     """
     total_pairs = []
     transitions = []

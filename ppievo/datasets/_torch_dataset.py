@@ -8,12 +8,22 @@ from esm.data import Alphabet
 from ppievo.io import read_transitions
 
 
-# TODO: filter out sequences that are too long
-# allow loading multiple families
+# TODO: allow loading multiple families
 # https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/datasets/_torch_datasets.py#L154
 class PairMSADataset(Dataset):
-    def __init__(self, pair_name: str, transitions_dir: str, vocab: Alphabet):
+    def __init__(
+        self,
+        pair_name: str,
+        transitions_dir: str,
+        vocab: Alphabet,
+        max_length: int = 1022,
+    ):
         """
+        Torch dataset object for transition data from pair MSAs
+        Note: the indication of which protein in the complex is 'x' and
+        which one is 'y' is somewhat arbitrary.
+        In the current implementation, 'y' is the protein whose tree determines the cherries.
+
         Args:
         pair_name (str): "{protein_1}_{protein_2}"
         transitions_dir(str): Directory storing all transitions, each file is
@@ -40,6 +50,27 @@ class PairMSADataset(Dataset):
         self.tx, self.ty = [], []
 
         for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in transitions:
+            x1_seq_len = len(x1_aln.replace("-", ""))
+            x2_seq_len = len(x2_aln.replace("-", ""))
+            y1_seq_len = len(y1_aln.replace("-", ""))
+            y2_seq_len = len(y2_aln.replace("-", ""))
+
+            # Filter out transitions where any of the protein is too long
+            # This is because we use ESM to embed each protein separately
+            # and ESM has a length limit
+            if (
+                x1_seq_len > max_length
+                or x2_seq_len > max_length
+                or y1_seq_len > max_length
+                or y2_seq_len > max_length
+            ):
+                continue
+
+            self.x1_len.append(x1_seq_len)
+            self.x2_len.append(x2_seq_len)
+            self.y1_len.append(y1_seq_len)
+            self.y2_len.append(y2_seq_len)
+
             self.x1_aln_toks.append(torch.tensor(self.vocab.encode(x1_aln)))
             self.x1_toks.append(
                 torch.tensor(self.vocab.encode(x1_aln.replace("-", "")))
@@ -56,11 +87,6 @@ class PairMSADataset(Dataset):
             self.y2_toks.append(
                 torch.tensor(self.vocab.encode(y2_aln.replace("-", "")))
             )
-
-            self.x1_len.append(len(x1_aln.replace("-", "")))
-            self.x2_len.append(len(x2_aln.replace("-", "")))
-            self.y1_len.append(len(y1_aln.replace("-", "")))
-            self.y2_len.append(len(y2_aln.replace("-", "")))
 
             self.tx.append(tx)
             self.ty.append(ty)
@@ -87,23 +113,68 @@ class PairMSADataset(Dataset):
         }
 
 
-class PairMSACollator:
+def mask_for_mlm(
+    seqs: list[torch.Tensor], mask_prob: float, mask_idx: int, padding_idx: int
+):
     """
-    Batch collator for PairMSA Dataset
-
-    FUTURE NOTE:
-    Current implementation ignores the aligned tokens, which is not needed for training
-    For batched evaluation we would need the aligned tokens to identify the gap positions
-    Similar to: https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/evaluation/_per_site_log_likelihood_transformer.py#L218
+    Apply uniform masking on sequences
+    Should be done prior to padding since in the targets we fill all the
+    non-masked positions with paddings
     """
+    x_mlm_masks = [torch.rand_like(seq, dtype=torch.float) < mask_prob for seq in seqs]
 
-    def __init__(self, vocab: Alphabet, mask_prob: float = 0.15):
+    x_mlm_inputs = [
+        seq.masked_fill(mask, mask_idx) for seq, mask in zip(seqs, x_mlm_masks)
+    ]
+
+    x_mlm_targets = [
+        seq.masked_fill(~mask, padding_idx) for seq, mask in zip(seqs, x_mlm_masks)
+    ]
+
+    return x_mlm_inputs, x_mlm_targets
+
+
+def mask_set_for_mlm(
+    seqset: list[list[torch.Tensor]], mask_prob: float, mask_idx: int, padding_idx: int
+):
+    inputs = []
+    targets = []
+    for seqs in seqset:
+        x_mlm_inputs, x_mlm_targets = mask_for_mlm(
+            seqs=seqs, mask_prob=mask_prob, mask_idx=mask_idx, padding_idx=padding_idx
+        )
+        inputs.append(x_mlm_inputs)
+        targets.append(x_mlm_targets)
+    return inputs, targets
+
+
+class PipetCollator:
+    def __init__(
+        self,
+        vocab: Alphabet,
+        mask_prob: float = 0.15,
+        device: torch.device = torch.device("cuda"),
+    ):
+        """
+        Batch collator for PairMSA Dataset used for the Pipet
+
+        FUTURE NOTE:
+        Current implementation ignores the tokens including gaps, which is not needed for training
+        For likelihood evaluation, if the full length unaligned sequence is longer than the alignment
+        (e.g. when we have insertions relative to the query)
+        we would need a mask to denote which position in the unaligned is in the alignment
+        and the aligned tokens to identify the non-gap positions.
+        Similar to: https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/evaluation/_per_site_log_likelihood_transformer.py#L218
+        Since currently, the unaligned sequence is obtained from the alignment
+        i.e. by removing all gaps, we can keep all likelihoods
+        """
         self.vocab = vocab
         self.mask_prob = mask_prob
         # We use one of the superfluous token in the ESM-1b vocab
         # as the token to separate the chains in the decoder
         self.sep_token = "."
         self.sep_idx = self.vocab.get_idx(self.sep_token)
+        self.device = device
 
     def __call__(self, batch):
         """
@@ -125,8 +196,11 @@ class PairMSACollator:
             distances.append([b["tx"], b["ty"]])
 
         # Create masked x1 and y1 for MLM loss#
-        enc_inputs, enc_targets = self.mask_set_for_mlm(
-            seqset=enc_seqs, mask_prob=self.mask_prob
+        enc_inputs, enc_targets = mask_set_for_mlm(
+            seqset=enc_seqs,
+            mask_prob=self.mask_prob,
+            mask_idx=self.vocab.mask_idx,
+            padding_idx=self.vocab.padding_idx,
         )
 
         # Add <cls> and <eos> to both encoder input sequences
@@ -196,7 +270,7 @@ class PairMSACollator:
         for i, d in enumerate(distances):
             distances_tensor[i, : len(d)] = torch.tensor(d)
 
-        return (
+        batch = (
             enc_inputs,
             enc_targets,
             dec_inputs,
@@ -205,36 +279,103 @@ class PairMSACollator:
             attn_mask_dec_lengths,
             distances_tensor,
         )
+        batch = [b.to(self.device) for b in batch]
+        return batch
 
-    def mask_for_mlm(self, seqs: list[torch.Tensor], mask_prob: float):
+
+class PeintCollator:
+
+    def __init__(
+        self,
+        vocab: Alphabet,
+        which_protein: str = "y",
+        mask_prob: float = 0.0,
+        device: torch.device = torch.device("cuda"),
+        return_aln_seq: bool = True,
+    ):
         """
-        Apply uniform masking on sequences
-        Should be done prior to padding since in the targets we fill all the
-        non-masked positions with paddings
+        Batch collator for Peint (which doesn't model complexes)
+        Follows https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/datasets/_torch_datasets.py#L442
+
+        Args:
+        which_protein: Indicate which protein in the complex we want Peint to model
+        either x or y
+        return_aln_seq: If true, also return the tokenized aligned target sequence
+        (no special token added) as a list of tensors
         """
-        x_mlm_masks = [
-            torch.rand_like(seq, dtype=torch.float) < mask_prob for seq in seqs
+        self.vocab = vocab
+        self.which_protein = which_protein
+        if self.which_protein not in ["x", "y"]:
+            raise ValueError("`which_protein` should be 'x' or 'y'")
+        self.mask_prob = mask_prob
+        self.device = device
+        self.return_aln_seq = return_aln_seq
+
+    def __call__(self, batch):
+        if self.which_protein == "x":
+            enc_seqs = [b["x1_toks"] for b in batch]
+            dec_seqs = [b["x2_toks"] for b in batch]
+            distances = [b["tx"] for b in batch]
+            dec_aln_seqs = [b["x2_aln_toks"] for b in batch]
+        else:
+            enc_seqs = [b["y1_toks"] for b in batch]
+            dec_seqs = [b["y2_toks"] for b in batch]
+            distances = [b["ty"] for b in batch]
+            dec_aln_seqs = [b["y2_aln_toks"] for b in batch]
+
+        # Process encoder inputs
+        enc_inputs, enc_targets = mask_for_mlm(
+            seqs=enc_seqs,
+            mask_prob=self.mask_prob,
+            mask_idx=self.vocab.mask_idx,
+            padding_idx=self.vocab.padding_idx,
+        )
+        # Add <cls>, <eos>, then pad --> shape (B, L)
+        enc_inputs = [
+            F.pad(seq, (0, 1), value=self.vocab.eos_idx) for seq in enc_inputs
         ]
-
-        x_mlm_inputs = [
-            seq.masked_fill(mask, self.vocab.mask_idx)
-            for seq, mask in zip(seqs, x_mlm_masks)
+        enc_inputs = [
+            F.pad(seq, (1, 0), value=self.vocab.cls_idx) for seq in enc_inputs
         ]
-
-        x_mlm_targets = [
-            seq.masked_fill(~mask, self.vocab.padding_idx)
-            for seq, mask in zip(seqs, x_mlm_masks)
+        enc_inputs = nn.utils.rnn.pad_sequence(
+            enc_inputs, batch_first=True, padding_value=self.vocab.padding_idx
+        )
+        enc_targets = [
+            F.pad(seq, (0, 1), value=self.vocab.eos_idx) for seq in enc_targets
         ]
+        enc_targets = [
+            F.pad(seq, (1, 0), value=self.vocab.cls_idx) for seq in enc_targets
+        ]
+        enc_targets = nn.utils.rnn.pad_sequence(
+            enc_targets, batch_first=True, padding_value=self.vocab.padding_idx
+        )
 
-        return x_mlm_inputs, x_mlm_targets
+        # Process decoder inputs
+        # Add <eos> then pad the decoder sequence
+        dec_seqs = [F.pad(seq, (0, 1), value=self.vocab.eos_idx) for seq in dec_seqs]
+        dec_seqs = nn.utils.rnn.pad_sequence(
+            dec_seqs, batch_first=True, padding_value=self.vocab.padding_idx
+        )
+        # Remove <eos> then add <cls> to start to form decoder input
+        dec_inputs = F.pad(dec_seqs[:, :-1], (1, 0), value=self.vocab.cls_idx)
+        dec_targets = dec_seqs
 
-    def mask_set_for_mlm(self, seqset: list[list[torch.Tensor]], mask_prob: float):
-        inputs = []
-        targets = []
-        for seqs in seqset:
-            x_mlm_inputs, x_mlm_targets = self.mask_for_mlm(
-                seqs=seqs, mask_prob=mask_prob
-            )
-            inputs.append(x_mlm_inputs)
-            targets.append(x_mlm_targets)
-        return inputs, targets
+        # Process distance, shape (B, 1)
+        distance_tensor = torch.tensor(distances).unsqueeze(-1)
+
+        enc_padding_mask = enc_inputs == self.vocab.padding_idx
+        dec_padding_mask = dec_inputs == self.vocab.padding_idx
+
+        batch = (
+            enc_inputs,
+            enc_targets,
+            dec_inputs,
+            dec_targets,
+            distance_tensor,
+            enc_padding_mask,
+            dec_padding_mask,
+        )
+        batch = [b.to(self.device) for b in batch]
+        if self.return_aln_seq:
+            batch.append(dec_aln_seqs)
+        return batch

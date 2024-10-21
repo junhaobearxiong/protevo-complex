@@ -6,7 +6,7 @@ import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
-from ppievo.models.modules import (
+from ppievo.models._modules import (
     EncoderLayer,
     DecoderLayer,
     LMHead,

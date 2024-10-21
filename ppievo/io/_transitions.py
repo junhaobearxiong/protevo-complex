@@ -119,3 +119,28 @@ def _test_get_leaf_distance():
 
 
 _test_get_leaf_distance()
+
+
+def filter_transitions_by_protein_and_length(
+    transitions, which_protein: str = "y", max_length: int = 1022
+):
+    # lls have all transitions where one of the sequences are too long filtered out
+    if which_protein == "x":
+        transitions = [
+            (x1_aln, x2_aln, tx)
+            for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in transitions
+            if len(x1_aln) <= max_length
+            and len(x2_aln) <= max_length
+            and len(y1_aln) <= max_length
+            and len(y2_aln) <= max_length
+        ]
+    else:
+        transitions = [
+            (y1_aln, y2_aln, ty)
+            for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in transitions
+            if len(x1_aln) <= max_length
+            and len(x2_aln) <= max_length
+            and len(y1_aln) <= max_length
+            and len(y2_aln) <= max_length
+        ]
+    return transitions
