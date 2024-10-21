@@ -8,7 +8,12 @@ import lightning as pl
 from lightning.pytorch.callbacks import ModelCheckpoint, Callback
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 
-from ppievo.models.modules import EncoderLayer, DecoderLayer, LMHead
+from ppievo.models.modules import (
+    EncoderLayer,
+    DecoderLayer,
+    LMHead,
+    MultiSequenceESMEmbed,
+)
 
 
 class Pipet(nn.Module):
@@ -28,6 +33,9 @@ class Pipet(nn.Module):
         embedding_dim: int,
         num_heads: int,
         vocab,
+        esm_model=None,
+        use_esm_input_embed=False,
+        use_esm_final_embed=False,
         **kwargs,
     ):
 
@@ -41,10 +49,22 @@ class Pipet(nn.Module):
         ), "embedding_dim must be divisible by num_heads"
         self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
+        self.use_esm_input_embed = use_esm_input_embed
+        self.use_esm_final_embed = use_esm_final_embed
+
+        self.embed_tokens = nn.Embedding(len(vocab), embedding_dim)
+        if self.use_esm_input_embed is not None:
+            # Use ESM input embedding layer weights and freeze it
+            self.embed_tokens.load_state_dict(esm_model.embed_tokens.state_dict())
+            self.embed_tokens.requires_grad_(False)
+
+        if self.use_esm_final_embed:
+            # Use the entire ESM to compute its final embedding
+            # as the input to the encoder
+            self.esm_embed = MultiSequenceESMEmbed(esm_model=esm_model, vocab=vocab)
 
         # Same weights are used to encode vocab into embedding
         # and decode embedding back to vocab
-        self.embed_tokens = nn.Embedding(len(vocab), embedding_dim)
         self.lm_head = LMHead(embedding_dim, len(vocab), self.embed_tokens.weight)
 
         self.criterion = nn.CrossEntropyLoss(ignore_index=vocab.padding_idx)
@@ -78,9 +98,17 @@ class Pipet(nn.Module):
     def forward(
         self, enc_in, dec_in, enc_attn_mask, dec_attn_mask, distances, **kwargs
     ):
-        # embed
-        h_enc = self.embed_tokens(enc_in)
+        # Embed input tokens for decoder
         h_dec = self.embed_tokens(dec_in)
+
+        if self.use_esm_final_embed is not None:
+            # Use the ESM final layer embedding for encoder inputs
+            # Each sequence in encoder input is embedded separatedly
+            # enc_attn_mask indicates the sequence boundary
+            h_enc = self.esm_embed(enc_in, enc_attn_mask)
+        else:
+            # Use standard input embedding for encoder inputs
+            h_enc = self.embed_tokens(enc_in)
 
         for i, enc_layer in enumerate(self.enc_layers):
             h_enc = enc_layer(h_enc, enc_attn_mask)

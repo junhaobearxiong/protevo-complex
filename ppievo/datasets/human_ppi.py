@@ -886,28 +886,28 @@ def main():
         "test": os.path.join(transition_parent_dir, "test"),
     }
 
-    # Train test split and subsample the MSAs
-    print("Train test split and subsampling MSAs...")
-    train_test_split_subsample_all_msas(
-        input_msa_dir=os.path.join(DATA_DIR, "pair_msa"),
-        output_msa_dir=msa_parent_dir,
-        max_num_sequences=1024,
-        min_num_sequences=500,
-        max_vertebrates_proportion=max_vertebrates_proportion,
-        num_train_pairs=1000,
-        num_test_pairs=1000,
-        num_processes=num_processes,
-        sequence_id_filtering=seq_id,
-        sequence_id_filter_on_pair=seq_id_filter_on_pair,
-    )
+    # # Train test split and subsample the MSAs
+    # print("Train test split and subsampling MSAs...")
+    # train_test_split_subsample_all_msas(
+    #     input_msa_dir=os.path.join(DATA_DIR, "pair_msa"),
+    #     output_msa_dir=msa_parent_dir,
+    #     max_num_sequences=1024,
+    #     min_num_sequences=500,
+    #     max_vertebrates_proportion=max_vertebrates_proportion,
+    #     num_train_pairs=1000,
+    #     num_test_pairs=1000,
+    #     num_processes=num_processes,
+    #     sequence_id_filtering=seq_id,
+    #     sequence_id_filter_on_pair=seq_id_filter_on_pair,
+    # )
 
-    # Estimate trees on the unpair MSAs
-    print("Estimating trees...")
-    estimate_trees(
-        msa_dir=msa_dirs["train"],
-        output_dir=tree_dirs["train"],
-        num_processes=num_processes,
-    )
+    # # Estimate trees on the unpair MSAs
+    # print("Estimating trees...")
+    # estimate_trees(
+    #     msa_dir=msa_dirs["train"],
+    #     output_dir=tree_dirs["train"],
+    #     num_processes=num_processes,
+    # )
     # estimate_trees(
     #     msa_dir=msa_dirs["test"],
     #     output_dir=tree_dirs["test"],

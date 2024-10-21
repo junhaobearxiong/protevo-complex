@@ -421,6 +421,27 @@ class MultiSequenceCrossAttention(nn.Module):
         return self.out_proj(out)
 
 
+class MultiSequenceESMEmbed(nn.Module):
+    def __init__(self, esm_model, vocab):
+        super().__init__()
+        self.esm = esm_model
+        self.vocab = vocab
+        self.esm.eval()
+        self.esm.requires_grad(False)
+
+    def forward(self, x, attn_mask_in_length):
+        """
+        Compute ESM embedding separately for each sequence in the batch
+        Can probably use attn_mask to create a separate padding mask for each
+        sequence that turns all tokens besides those of this sequence to padding
+        ESM then deals with padding internally
+        Check it is okay for there to be <pad> before <cls> token
+        i.e. check how padding_mask is implemented
+        """
+
+        pass
+
+
 class EncoderLayer(nn.Module):
     def __init__(
         self,
