@@ -71,7 +71,10 @@ def evaluate_peint_per_site_log_likelihood_for_pair(
     """
     # print("Start loading dataset..")
     dataset = PairMSADataset(
-        pair_name=pair_name, transitions_dir=transitions_dir, vocab=vocab
+        pair_name=pair_name,
+        transitions_dir=transitions_dir,
+        vocab=vocab,
+        return_aligned_sequences=True,
     )
     collate_fn = PeintCollator(vocab=vocab, which_protein=which_protein, mask_prob=0)
     loader = DataLoader(

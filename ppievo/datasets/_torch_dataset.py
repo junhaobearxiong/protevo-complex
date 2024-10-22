@@ -9,8 +9,6 @@ from esm.data import Alphabet
 from ppievo.io import read_transitions
 
 
-# TODO: allow loading multiple families
-# https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/datasets/_torch_datasets.py#L154
 class PairMSADataset(Dataset):
     def __init__(
         self,
@@ -18,6 +16,7 @@ class PairMSADataset(Dataset):
         transitions_dir: str,
         vocab: Alphabet,
         max_length: int = 1022,
+        return_aligned_sequences: bool = False,
     ):
         """
         Torch dataset object for transition data from pair MSAs
@@ -32,26 +31,27 @@ class PairMSADataset(Dataset):
         vocab (Alphabet): Vocabulary for encoding sequences
         """
         super(PairMSADataset, self).__init__()
+        self.vocab = vocab
+        self.max_length = max_length
+        self.return_aligned_sequences = return_aligned_sequences
+
         # Read transition data from all pairs
         transitions = []
         for pair_name in pair_names:
             transitions.extend(
                 read_transitions(os.path.join(transitions_dir, pair_name + ".txt"))
             )
-        self.vocab = vocab
+
         # Tokenized unaligned sequences (i.e. no gaps)
         self.x1_toks, self.x2_toks, self.y1_toks, self.y2_toks = [], [], [], []
-        # Tokenized aligned sequences (i.e. have gaps)
-        self.x1_aln_toks, self.x2_aln_toks, self.y1_aln_toks, self.y2_aln_toks = (
-            [],
-            [],
-            [],
-            [],
-        )
         # Lengths of unaligned sequences
         self.x1_len, self.x2_len, self.y1_len, self.y2_len = [], [], [], []
         # Branch lengths
         self.tx, self.ty = [], []
+        if return_aligned_sequences:
+            # Tokenized aligned sequences (i.e. have gaps)
+            self.x1_aln_toks, self.x2_aln_toks = [], []
+            self.y1_aln_toks, self.y2_aln_toks = [], []
 
         for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in transitions:
             x1_seq_len = len(x1_aln.replace("-", ""))
@@ -70,44 +70,45 @@ class PairMSADataset(Dataset):
             ):
                 continue
 
+            # Sequence lengths
             self.x1_len.append(x1_seq_len)
             self.x2_len.append(x2_seq_len)
             self.y1_len.append(y1_seq_len)
             self.y2_len.append(y2_seq_len)
 
-            self.x1_aln_toks.append(torch.tensor(self.vocab.encode(x1_aln)))
+            # Unaligned tokens
             self.x1_toks.append(
                 torch.tensor(self.vocab.encode(x1_aln.replace("-", "")))
             )
-            self.x2_aln_toks.append(torch.tensor(self.vocab.encode(x2_aln)))
             self.x2_toks.append(
                 torch.tensor(self.vocab.encode(x2_aln.replace("-", "")))
             )
-            self.y1_aln_toks.append(torch.tensor(self.vocab.encode(y1_aln)))
             self.y1_toks.append(
                 torch.tensor(self.vocab.encode(y1_aln.replace("-", "")))
             )
-            self.y2_aln_toks.append(torch.tensor(self.vocab.encode(y2_aln)))
             self.y2_toks.append(
                 torch.tensor(self.vocab.encode(y2_aln.replace("-", "")))
             )
-
+            # Branch lengths
             self.tx.append(tx)
             self.ty.append(ty)
+
+            # Aligned tokens
+            if self.return_aligned_sequences:
+                self.x1_aln_toks.append(torch.tensor(self.vocab.encode(x1_aln)))
+                self.x2_aln_toks.append(torch.tensor(self.vocab.encode(x2_aln)))
+                self.y1_aln_toks.append(torch.tensor(self.vocab.encode(y1_aln)))
+                self.y2_aln_toks.append(torch.tensor(self.vocab.encode(y2_aln)))
 
     def __len__(self):
         return len(self.x1_toks)
 
     def __getitem__(self, index):
-        return {
+        item = {
             "x1_toks": self.x1_toks[index],
             "x2_toks": self.x2_toks[index],
             "y1_toks": self.y1_toks[index],
             "y2_toks": self.y2_toks[index],
-            "x1_aln_toks": self.x1_aln_toks[index],
-            "x2_aln_toks": self.x2_aln_toks[index],
-            "y1_aln_toks": self.y1_aln_toks[index],
-            "y2_aln_toks": self.y2_aln_toks[index],
             "x1_len": self.x1_len[index],
             "x2_len": self.x2_len[index],
             "y1_len": self.y1_len[index],
@@ -115,6 +116,16 @@ class PairMSADataset(Dataset):
             "tx": self.tx[index],
             "ty": self.ty[index],
         }
+        if self.return_aligned_sequences:
+            item.update(
+                {
+                    "x1_aln_toks": self.x1_aln_toks[index],
+                    "x2_aln_toks": self.x2_aln_toks[index],
+                    "y1_aln_toks": self.y1_aln_toks[index],
+                    "y2_aln_toks": self.y2_aln_toks[index],
+                }
+            )
+        return item
 
 
 def mask_for_mlm(
@@ -398,8 +409,9 @@ class PairMSADataModule(pl.LightningDataModule):
         vocab: Alphabet,
         max_length: int = 1022,
         mask_prob: float = 0.15,
-        batch_size=32,
-        train_frac=0.85,
+        batch_size: int = 32,
+        train_frac: float = 0.85,
+        num_workers: int = 8,
     ):
         super().__init__()
         self.pair_names = pair_names
@@ -410,6 +422,7 @@ class PairMSADataModule(pl.LightningDataModule):
         self.mask_prob = mask_prob
         self.train_frac = train_frac
         self.val_frac = 1 - train_frac
+        self.num_workers = num_workers
 
     def setup(self, stage=None):
         self.dataset = PairMSADataset(
@@ -430,6 +443,7 @@ class PairMSADataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
         )
 
     def val_dataloader(self):
@@ -438,4 +452,5 @@ class PairMSADataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             collate_fn=self.collate_fn,
+            num_workers=self.num_workers,
         )

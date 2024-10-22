@@ -3,8 +3,6 @@ import torch.nn as nn
 from torch.nn import functional as F
 from einops import rearrange
 import lightning as pl
-from lightning.pytorch.callbacks import ModelCheckpoint, Callback
-from lightning.pytorch.utilities.types import STEP_OUTPUT
 
 from ppievo.models._modules import (
     EncoderLayer,
@@ -12,6 +10,11 @@ from ppievo.models._modules import (
     LMHead,
     MultiSequenceESMEmbed,
 )
+from ppievo.models._model_utils import (
+    _create_sequence_mask,
+    _expand_distances_to_seqlen,
+)
+from ppievo.training._training_utils import get_polynomial_decay_schedule_with_warmup
 
 
 class Pipet(nn.Module):
@@ -130,9 +133,133 @@ class Pipet(nn.Module):
 
         return enc_logits, dec_logits
 
+    def training_step(self, batch):
+        (
+            enc_inputs,
+            enc_targets,
+            dec_inputs,
+            dec_targets,
+            attn_mask_enc_lengths,
+            attn_mask_dec_lengths,
+            distances_tensor,
+        ) = batch
 
-# TODO: update to allow loading in pretrained ESM model
-# https://github.com/songlab-cal/protein-evolution/blob/91e64da3a87fe8497694acaac22aefdb233d2210/protevo/models/_transformer.py#L1181
+        logits = self(
+            enc_inputs,
+            dec_inputs,
+            attn_mask_enc_lengths,
+            attn_mask_dec_lengths,
+            distances_tensor,
+        )
+
+        if isinstance(self.criterion, nn.CrossEntropyLoss):
+            # Cross entropy loss expects the logits to be in the second to last dimension
+            logits = [l.transpose(-1, -2) for l in logits]
+        enc_logits, dec_logits = logits
+
+        # Mask language model loss on the encoder
+        mlm_loss = self.criterion(enc_logits, enc_targets)
+        # Causal language model loss on the decoder
+        clm_loss = self.criterion(dec_logits, dec_targets)
+
+        mlm_ppl = torch.exp(mlm_loss.detach())
+        clm_ppl = torch.exp(clm_loss.detach())
+
+        loss = mlm_loss + clm_loss
+
+        metrics = {
+            "loss": loss,
+            "mlm_loss": mlm_loss,
+            "clm_loss": clm_loss,
+            "mlm_ppl": mlm_ppl,
+            "clm_ppl": clm_ppl,
+        }
+        return metrics
+
+    def validation_step(self, batch):
+        (
+            enc_inputs,
+            enc_targets,
+            dec_inputs,
+            dec_targets,
+            attn_mask_enc_lengths,
+            attn_mask_dec_lengths,
+            distances_tensor,
+        ) = batch
+
+        with torch.no_grad():
+            logits = self(
+                enc_inputs,
+                dec_inputs,
+                attn_mask_enc_lengths,
+                attn_mask_dec_lengths,
+                distances_tensor,
+            )
+
+        enc_logits, dec_logits = logits
+        mlm_loss = F.cross_entropy(
+            enc_logits.transpose(-1, -2),
+            enc_targets,
+            ignore_index=self.vocab.padding_idx,
+            reduction="mean",
+        )
+        mlm_ppl = torch.exp(mlm_loss.detach())
+
+        # Keep unreduced to get per-site time likelihood
+        clm_loss = F.cross_entropy(
+            dec_logits.transpose(-1, -2),
+            dec_targets,
+            ignore_index=self.vocab.padding_idx,
+            reduction="none",
+        ).detach()
+
+        # Obtain the per-site likelihood for x2 and y2 separately
+        # Generate mask for x2 and y2 in the decoder targets
+        x_seq_mask = _create_sequence_mask(attn_mask_dec_lengths, sequence_idx=0)
+        y_seq_mask = _create_sequence_mask(attn_mask_dec_lengths, sequence_idx=1)
+        # Expand the distance to be per position, shape (B, L)
+        distances_seqlen = _expand_distances_to_seqlen(
+            distances_tensor, attn_mask_dec_lengths
+        )
+
+        # Shape (total num tokens of x in the batch,)
+        x_dist = distances_seqlen[x_seq_mask]
+        x_ll = -clm_loss[x_seq_mask]
+        # Dict: distance --> per-site log likelihood of x
+        x_ll_per_dist = {
+            d.item(): x_ll[x_dist == d].cpu().numpy() for d in x_dist.unique()
+        }
+        # Shape (total num tokens of y in the batch,)
+        y_dist = distances_seqlen[y_seq_mask]
+        y_ll = -clm_loss[y_seq_mask]
+        y_ll_per_dist = {
+            d.item(): y_ll[y_dist == d].cpu().numpy() for d in y_dist.unique()
+        }
+
+        # Average decoder metrics
+        padding_mask = dec_targets != self.vocab.padding_idx
+        clm_loss_mean = clm_loss[padding_mask].mean()
+        clm_ppl = torch.exp(clm_loss_mean)
+        loss = mlm_loss + clm_loss_mean
+        acc = (
+            (dec_logits.argmax(-1)[padding_mask] == dec_targets[padding_mask])
+            .float()
+            .mean()
+            .item()
+        )
+
+        metrics = {
+            "loss": loss,
+            "clm_loss": clm_loss_mean,
+            "clm_ppl": clm_ppl,
+            "acc": acc,
+            "mlm_loss": mlm_loss,
+            "mlm_ppl": mlm_ppl,
+        }
+        ll_per_dist = (x_ll_per_dist, y_ll_per_dist)
+        return metrics, ll_per_dist
+
+
 class PipetModule(pl.LightningModule):
     """
     Lightning Module Wrapper around the Pipet Model
@@ -140,11 +267,6 @@ class PipetModule(pl.LightningModule):
 
     def __init__(
         self,
-        num_encoder_layers: int,
-        num_decoder_layers: int,
-        embedding_dim: int,
-        num_heads: int,
-        vocab,
         lr: float = 1e-4,
         num_warmup_steps: int = 10000,
         num_training_steps: int = 100000,
@@ -152,15 +274,7 @@ class PipetModule(pl.LightningModule):
     ):
         super().__init__()
 
-        self.model = Pipet(
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            embedding_dim=embedding_dim,
-            num_heads=num_heads,
-            vocab=vocab,
-            **kwargs,
-        )
-
+        self.model = Pipet(**kwargs)
         self.lr = lr
         self.wd = kwargs.get("weight_decay", 0.0)
         self.num_warmup_steps = num_warmup_steps
@@ -190,86 +304,40 @@ class PipetModule(pl.LightningModule):
                 )
 
     def training_step(self, batch, batch_idx):
-        (
-            enc_inputs,
-            enc_targets,
-            dec_inputs,
-            dec_targets,
-            attn_mask_enc_lengths,
-            attn_mask_dec_lengths,
-            distances_tensor,
-        ) = batch
-
-        logits = self.model(
-            enc_inputs,
-            dec_inputs,
-            attn_mask_enc_lengths,
-            attn_mask_dec_lengths,
-            distances_tensor,
-        )
-
-        if isinstance(self.model.criterion, nn.CrossEntropyLoss):
-            # Cross entropy loss expects the logits to be in the second to last dimension
-            logits = [l.transpose(-1, -2) for l in logits]
-        enc_logits, dec_logits = logits
-
-        # Mask language model loss on the encoder
-        mlm_loss = self.model.criterion(enc_logits, enc_targets)
-        # Causal language model loss on the decoder
-        clm_loss = self.model.criterion(dec_logits, dec_targets)
-
-        mlm_ppl = torch.exp(mlm_loss.detach())
-        clm_ppl = torch.exp(clm_loss.detach())
-
-        loss = mlm_loss + clm_loss
-
-        return {
-            "loss": loss,
-            "mlm_loss": mlm_loss,
-            "clm_loss": clm_loss,
-            "mlm_ppl": mlm_ppl,
-            "clm_ppl": clm_ppl,
-        }
+        metrics = self.model.training_step(batch)
+        self._log(metrics, train=True)
+        return metrics["loss"]
 
     def validation_step(self, batch, batch_idx):
-        (
-            enc_inputs,
-            enc_targets,
-            dec_inputs,
-            dec_targets,
-            attn_mask_enc_lengths,
-            attn_mask_dec_lengths,
-            distances_tensor,
-        ) = batch
+        metrics, ll_per_dist = self.model.validation_step(batch)
+        self._log(metrics, train=False)
+        return metrics, ll_per_dist
 
-        with torch.no_grad():
-            logits = self.model(
-                enc_inputs,
-                dec_inputs,
-                attn_mask_enc_lengths,
-                attn_mask_dec_lengths,
-                distances_tensor,
-            )
+    def configure_optimizers(self):
+        # multiple param groups for the encoder and decoder
+        # start with all of the candidate parameters
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        # filter out those that do not require grad
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
+        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
+        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {"params": decay_params, "weight_decay": self.wd},
+            {"params": nodecay_params, "weight_decay": 0.0},
+        ]
 
-        enc_logits, dec_logits = logits
-        mlm_loss = F.cross_entropy(
-            enc_logits.transpose(-1, -2),
-            enc_targets,
-            ignore_index=self.vocab.padding_idx,
-        )
-        clm_loss = F.cross_entropy(
-            dec_logits.transpose(-1, -2),
-            dec_targets,
-            ignore_index=self.vocab.padding_idx,
-        )
-        mlm_ppl = torch.exp(mlm_loss.detach())
-        clm_ppl = torch.exp(clm_loss.detach())
-        loss = mlm_loss + clm_loss
+        optimizer = torch.optim.AdamW(optim_groups, lr=self.lr)
 
-        return {
-            "loss": loss,
-            "mlm_loss": mlm_loss,
-            "clm_loss": clm_loss,
-            "mlm_ppl": mlm_ppl,
-            "clm_ppl": clm_ppl,
+        scheduler = {
+            "scheduler": get_polynomial_decay_schedule_with_warmup(
+                optimizer,
+                self.num_warmup_steps,
+                self.num_training_steps,
+                power=2.0,
+            ),
+            "name": "inverse-sqrt-lr",
+            "interval": "step",
         }
+        return [optimizer], [scheduler]

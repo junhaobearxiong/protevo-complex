@@ -1,4 +1,13 @@
+from typing import Any
+import os
+import numpy as np
+import lightning as pl
+from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.utilities.types import STEP_OUTPUT
+import wandb
 from torch.optim.lr_scheduler import LambdaLR
+
+from ppievo.utils import TIME_BINS, get_quantile_idx
 
 
 # Taken from HuggingFace Transformers.
@@ -53,3 +62,107 @@ def get_polynomial_decay_schedule_with_warmup(
             return decay / lr_init  # as LambdaLR multiplies by lr_init
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
+
+
+class ValidationLikelihoodCallback(Callback):
+    """
+    This callback is used to calculate the time-bin likelihoods for the validation set.
+    The actual likelihoods are calculated in the model's validation_step method.
+    This aggregates them and stores the t, likelihood pairs.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.x_ll_per_bin, self.y_ll_per_bin = {}, {}
+
+    def on_validation_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs: STEP_OUTPUT,
+        batch: Any,
+        batch_idx: int,
+        dataloader_idx: int = 0,
+    ) -> None:
+        _, (x_ll_per_dist, y_ll_per_dist) = outputs
+        for k, v in x_ll_per_dist.items():
+            # Quantized time
+            q_idx = get_quantile_idx(TIME_BINS, k)
+            if q_idx not in self.x_ll_per_bin:
+                self.x_ll_per_bin[q_idx] = []
+            self.x_ll_per_bin[q_idx].extend(v)
+        for k, v in y_ll_per_dist.items():
+            # Quantized time
+            q_idx = get_quantile_idx(TIME_BINS, k)
+            if q_idx not in self.y_ll_per_bin:
+                self.y_ll_per_bin[q_idx] = []
+            self.y_ll_per_bin[q_idx].extend(v)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Mean likelihoods over sites for each time bin
+        x_mean_likelihoods = np.zeros(len(TIME_BINS))
+        y_mean_likelihoods = np.zeros(len(TIME_BINS))
+        for k, v in self.x_ll_per_bin.items():
+            x_mean_likelihoods[k] = np.exp(np.mean(v))
+        for k, v in self.y_ll_per_bin.items():
+            y_mean_likelihoods[k] = np.exp(np.mean(v))
+
+        # Create tables for plotting
+        nonzero_x = np.nonzero(x_mean_likelihoods)[0]
+        data_x = [
+            [d1, d2]
+            for d1, d2 in zip(TIME_BINS[nonzero_x], x_mean_likelihoods[nonzero_x])
+        ]
+        table_x = wandb.Table(data=data_x, columns=["Time", "Mean per-site Likelihood"])
+
+        nonzero_y = np.nonzero(y_mean_likelihoods)[0]
+        data_y = [
+            [d1, d2]
+            for d1, d2 in zip(TIME_BINS[nonzero_y], y_mean_likelihoods[nonzero_y])
+        ]
+        table_y = wandb.Table(data=data_y, columns=["Time", "Mean per-site Likelihood"])
+
+        # Important for multi-gpu runs, doesn't seem to affect single gpu runs
+        if trainer.global_rank == 0:
+            trainer.logger.experiment.log(
+                {
+                    "x_time_bin_likelihood": wandb.plot.line(
+                        table_x,
+                        "Time",
+                        "Mean per-site Likelihood",
+                        title="Likelihood per time bin, Sequence x",
+                    )
+                }
+            )
+            trainer.logger.experiment.log(
+                {
+                    "y_time_bin_likelihood": wandb.plot.line(
+                        table_y,
+                        "Time",
+                        "Mean per-site Likelihood",
+                        title="Likelihood per time bin, Sequence y",
+                    )
+                }
+            )
+
+        # Clear for next epoch
+        self.x_ll_per_bin, self.y_ll_per_bin = {}, {}
+
+
+def gradient_norm(model):
+    total_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            param_norm = p.grad.detach().data.norm(2)
+            total_norm += param_norm.item() ** 2
+    total_norm = total_norm ** (1.0 / 2)
+    return total_norm
+
+
+class GradNormCallback(Callback):
+    """
+    Logs the gradient norm.
+    """
+
+    def on_before_optimizer_step(self, trainer, pl_module, optimizer):
+        trainer.logger.experiment.log({"my_model/grad_norm": gradient_norm(pl_module)})

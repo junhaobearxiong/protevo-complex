@@ -62,12 +62,14 @@ def _create_padding_mask(attention_mask_in_length):
     return mask < attention_mask_in_length.sum(dim=-1, keepdim=True)
 
 
-def _expand_distances_to_seqlen(self, distances_in_length, attn_mask_in_length):
+def _expand_distances_to_seqlen(distances_in_length, attn_mask_in_length):
     """
     Expand the per sequence distance to a positional encoding tensor
     using the length of each sequence in the batch
+    If distances_in_length and attn_mask_in_length have different length
+    the output will be the length of attn_mask_in_length
     """
-    pos = torch.zeros_like(distances_in_length)
+    pos = torch.zeros_like(attn_mask_in_length)
     B, _ = distances_in_length.size()
     for i in range(B):
         lengths = attn_mask_in_length[
@@ -76,10 +78,9 @@ def _expand_distances_to_seqlen(self, distances_in_length, attn_mask_in_length):
         dists = distances_in_length[
             i, torch.nonzero(attn_mask_in_length[i, :], as_tuple=False).flatten()
         ].float()
-        # repeat dists for each length
+        # Repeat dists for each length
         dists2 = dists.repeat_interleave(lengths)
         pos[i, : dists2.size(0)] = dists2
-
     return pos
 
 
