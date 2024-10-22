@@ -7,8 +7,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from flash_attn import flash_attn_varlen_qkvpacked_func, flash_attn_varlen_kvpacked_func
-from flash_attn.bert_padding import pad_input, unpad_input
+from flash_attn.bert_padding import (
+    pad_input,
+    unpad_input,
+    unpad_input_for_concatenated_sequences,
+)
 from flash_attn.layers.rotary import rotate_half
+
+from ppievo.models._model_utils import (
+    _create_padding_mask,
+    _create_sequence_mask,
+    _expand_distances_to_seqlen,
+    _generate_test_sequence_and_attn_mask_in_length,
+)
 
 
 class SwiGLU(nn.Module):
@@ -146,19 +157,136 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
-def _create_padding_mask(attention_mask_in_length):
-    """
-    Create an attention padding mask from the lengths of sequences in batch
-    The padding starts at the sum of the lengths of sequences in the batch
-    """
-    batch_size, seq_len = attention_mask_in_length.shape
-    mask = torch.arange(seq_len, device=attention_mask_in_length.device).expand(
-        batch_size, seq_len
-    )
-    return mask < attention_mask_in_length.sum(dim=-1, keepdim=True)
-
-
 class MultiSequenceMultiHeadSelfAttention(nn.Module):
+    """
+    Multi-head self-attention module for sets of sequences with restricted attention within each sequence.
+
+    This module applies attention separately to each sequence within a set, using rotary positional
+    encoding that resets for each sequence. It utilizes Flash Attention for efficient computation.
+    This works for single sequences in the set as well, and should replicate a normal FlashAttentionMHA module.
+
+    Args:
+        hidden_size (int): Size of the input and output features.
+        num_attention_heads (int): Number of attention heads.
+        max_position_embeddings (int): Maximum number of position embeddings.
+        attention_dropout (float, optional): Dropout probability for attention weights. Defaults to 0.0.
+
+    Example:
+        >>> hidden_size = 768
+        >>> num_attention_heads = 12
+        >>> max_position_embeddings = 2048
+        >>> attention = MultiSequenceMultiHeadAttention(hidden_size, num_attention_heads, max_position_embeddings)
+        >>> hidden_states = torch.randn(2, 10, hidden_size)
+        >>> attention_mask_in_length = torch.tensor([[4, 6, 0, 0, 0, 0, 0, 0, 0, 0],
+        ...                                          [3, 5, 0, 0, 0, 0, 0, 0, 0, 0]])
+        >>> output = attention(hidden_states, attention_mask_in_length)
+    """
+
+    def __init__(
+        self,
+        hidden_size,
+        num_attention_heads,
+        dropout_p=0.0,
+        causal=False,
+        layer_idx: Optional[int] = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_attention_heads = num_attention_heads
+        self.head_dim = hidden_size // num_attention_heads
+        assert (
+            self.head_dim * num_attention_heads == hidden_size
+        ), "hidden_size must be divisible by num_attention_heads"
+
+        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size)
+        self.out_proj = nn.Linear(hidden_size, hidden_size)
+
+        self.rotary_emb = MultiSequenceRotaryPositionalEncoding(
+            dim=self.head_dim,
+            use_fp32_for_idx=True,
+        )
+
+        self.dropout_p = dropout_p
+        self.causal = causal
+        self.layer_idx = layer_idx
+
+    def forward(self, hidden_states, attention_mask_in_length):
+        """
+
+        Args:
+            hidden_states (torch.Tensor): Input tensor of shape (batch_size, seq_len, hidden_size).
+                Contains the input features for the attention mechanism.
+            attention_mask_in_length (torch.Tensor): Tensor of shape (batch_size, seq_len) containing
+                the lengths of sequences in each batch. Non-zero values indicate the start and
+                length of each sequence, while zeros represent padding.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (batch_size, seq_len, hidden_size) containing
+                the attended features.
+
+        Note:
+            This method assumes that sequences within each batch are concatenated and padded to
+            the maximum sequence length. The `attention_mask_in_length` tensor is used to identify
+            the boundaries of individual sequences within each batch. It also keeps track of padding
+        """
+        bsz, q_len, _ = hidden_states.shape
+
+        # Project input to query, key, and value
+        qkv = self.qkv_proj(hidden_states)
+        qkv = rearrange(
+            qkv, "b s (three h d) -> b s three h d", three=3, h=self.num_attention_heads
+        )
+
+        # Split qkv into separate tensors
+        q, k, v = qkv.unbind(dim=2)
+        q = q * self.head_dim**-0.5  # rescale
+
+        # Apply rotary positional encoding to q and k
+        q_rotary = self.rotary_emb(q, attention_mask_in_length)
+        k_rotary = self.rotary_emb(k, attention_mask_in_length)
+
+        # Recombine into qkv
+        qkv_rotary = torch.stack([q_rotary, k_rotary, v], dim=2)
+
+        # Prepare for Flash Attention
+        qkv_flash = rearrange(qkv_rotary, "b s three h d -> b s (three h d)")
+        qkv_unpad, indices, cu_q_lens, max_s = unpad_input_for_concatenated_sequences(
+            qkv_flash, attention_mask_in_length
+        )
+        qkv_unpad = rearrange(
+            qkv_unpad,
+            "nnz (three h d) -> nnz three h d",
+            three=3,
+            h=self.num_attention_heads,
+        )
+
+        # Apply Flash Attention
+        output_unpad = flash_attn_varlen_qkvpacked_func(
+            qkv_unpad,
+            cu_q_lens,
+            max_s,
+            self.dropout_p,
+            softmax_scale=None,
+            causal=self.causal,
+        )
+
+        # Pad the output back to the original shape
+        output = rearrange(
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"), indices, bsz, q_len
+            ),
+            "b s (h d) -> b s h d",
+            h=self.num_attention_heads,
+        )
+
+        # Final projection
+        attn_output = rearrange(output, "b s h d -> b s (h d)")
+        attn_output = self.out_proj(attn_output)
+
+        return attn_output
+
+
+class FullMultiSequenceMultiHeadSelfAttention(nn.Module):
     """
     Multi-head self-attention module for pairs of sequences with full attention between sequences.
 
@@ -333,26 +461,6 @@ class MultiSequenceCrossAttention(nn.Module):
 
         self.dropout_p = dropout_p
 
-    def _expand_distances_to_seqlen(self, distances_in_length, attn_mask_in_length):
-        """
-        Expand the per sequence distance to a positional encoding tensor
-        using the length of each sequence in the batch
-        """
-        pos = torch.zeros_like(distances_in_length)
-        B, _ = distances_in_length.size()
-        for i in range(B):
-            lengths = attn_mask_in_length[
-                i, torch.nonzero(attn_mask_in_length[i, :], as_tuple=False).flatten()
-            ].long()
-            dists = distances_in_length[
-                i, torch.nonzero(attn_mask_in_length[i, :], as_tuple=False).flatten()
-            ].float()
-            # repeat dists for each length
-            dists2 = dists.repeat_interleave(lengths)
-            pos[i, : dists2.size(0)] = dists2
-
-        return pos
-
     def forward(
         self,
         q_states,
@@ -383,7 +491,7 @@ class MultiSequenceCrossAttention(nn.Module):
         k_rotary = self.rotary_emb(kv[:, :, 0], attention_mask_in_length_kv)
 
         # Apply sinusoidal distance encoding to k
-        distance_positions = self._expand_distances_to_seqlen(
+        distance_positions = _expand_distances_to_seqlen(
             distances_in_length, attention_mask_in_length_kv
         )
         k_distance_embeddings = self.distance_emb(distance_positions)
@@ -422,13 +530,15 @@ class MultiSequenceCrossAttention(nn.Module):
 
 
 class MultiSequenceESMEmbed(nn.Module):
-    def __init__(self, esm_model, vocab):
+    def __init__(self, esm_model: nn.Module, vocab: object):
         super().__init__()
         self.esm = esm_model
         self.vocab = vocab
         self.esm.eval()
         # Freeze ESM
         self.esm.requires_grad_(False)
+        # The embedding size is the shape of the last layer's layer norm
+        self.embed_dim = self.esm.layers[-1].final_layer_norm.normalized_shape[0]
 
     def forward(self, x, attn_mask_in_length):
         """
@@ -436,8 +546,9 @@ class MultiSequenceESMEmbed(nn.Module):
 
         Args:
             x (torch.Tensor): Input tensor of shape (batch_size, seq_len)
-            attn_mask_in_length (torch.Tensor): Tensor of shape (batch_size, num_sequences) containing
-                the lengths of sequences in each batch. Non-zero values indicate the length of each sequence,
+            attn_mask_in_length (torch.Tensor): Tensor of shape (batch_size, seq_len) containing
+                the lengths of sequences in each batch.
+                Non-zero values indicate the length of each sequence,
                 while zeros represent padding.
         """
         bsz, seq_len = x.shape
@@ -450,26 +561,17 @@ class MultiSequenceESMEmbed(nn.Module):
 
         num_sequences = num_sequences[0].item()
 
-        # The embedding size is the shape of the last layer's layer norm
-        embed_size = self.esm.layers[-1].final_layer_norm.normalized_shape[0]
         combined_embedding = torch.zeros(
-            (bsz, seq_len, embed_size), dtype=torch.float, device=x.device
+            (bsz, seq_len, self.embed_dim), dtype=torch.float, device=x.device
         )
 
         for seq_idx in range(num_sequences):
+            # Shape (B, L), True for the residues of `seq_idx`th sequence of each batch element
+            seq_mask = _create_sequence_mask(attn_mask_in_length, sequence_idx=seq_idx)
             # Create a copy of the input to avoid modifying the original
             x_seq = x.clone()
-            # Set padding for the current sequence
-            for i in range(bsz):
-                lengths = attn_mask_in_length[i, :num_sequences]
-                start_idx = sum(lengths[:seq_idx])
-                end_idx = start_idx + lengths[seq_idx]
-                # Set padding before the sequence
-                if start_idx > 0:
-                    x_seq[i, :start_idx] = self.vocab.padding_idx
-                # Set padding after the sequence
-                if end_idx < seq_len:
-                    x_seq[i, end_idx:] = self.vocab.padding_idx
+            # Set padding for all other positions
+            x_seq.masked_fill_(~seq_mask, self.vocab.padding_idx)
 
             # Compute embeddings for the current sequence
             with torch.no_grad():
@@ -477,9 +579,7 @@ class MultiSequenceESMEmbed(nn.Module):
                 embedding = output["representations"][self.esm.num_layers]
 
             # Add the current sequence embedding to the combined embedding
-            # mask: Shape (B, L, 1)
-            mask = (x_seq != self.vocab.padding_idx).unsqueeze(-1)
-            combined_embedding += embedding * mask
+            combined_embedding += embedding * seq_mask.unsqueeze(-1)
 
         return combined_embedding
 
@@ -495,37 +595,12 @@ def _test_multi_sequence_esm_embed(esm_model, vocab, device=torch.device("cuda")
         embedding = output["representations"][esm_model.num_layers]
         return embedding
 
-    # Create input data
-    batch_size = 5
-    max_seq_len = 20
-    x = torch.full((batch_size, max_seq_len), vocab.padding_idx, device=device)
-    attn_mask_in_length = torch.zeros((batch_size, 10), dtype=torch.long, device=device)
-    start_tok_idx, end_tok_idx = 4, 10
     atol = 1e-5  # absolute tolerance
-
-    # Fill in sequences
-    for i in range(batch_size):
-        seq1_len = torch.randint(
-            6, 10, (1,)
-        ).item()  # Random length between 3 and 5 (inclusive)
-        seq2_len = torch.randint(6, 10, (1,)).item()
-
-        # First sequence
-        x[i, 0] = vocab.cls_idx
-        x[i, 1 : seq1_len - 1] = torch.randint(
-            start_tok_idx, end_tok_idx, (seq1_len - 2,)
-        )
-        x[i, seq1_len - 1] = vocab.eos_idx
-
-        # Second sequence
-        x[i, seq1_len] = vocab.cls_idx
-        x[i, seq1_len + 1 : seq1_len + seq2_len - 1] = torch.randint(
-            start_tok_idx, end_tok_idx, (seq2_len - 2,)
-        )
-        x[i, seq1_len + seq2_len - 1] = vocab.eos_idx
-
-        attn_mask_in_length[i, 0] = seq1_len
-        attn_mask_in_length[i, 1] = seq2_len
+    # Generate some test sequences
+    x, attn_mask_in_length, _ = _generate_test_sequence_and_attn_mask_in_length(
+        vocab, device
+    )
+    batch_size = x.shape[0]
 
     # Embed the concat sequence
     esm_embed_multiseq = MultiSequenceESMEmbed(esm_model=esm_model, vocab=vocab)

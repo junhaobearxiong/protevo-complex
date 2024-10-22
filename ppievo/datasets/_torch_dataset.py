@@ -1,8 +1,9 @@
 import os
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader, random_split
 import torch.nn as nn
 import torch.nn.functional as F
+import lightning as pl
 
 from esm.data import Alphabet
 from ppievo.io import read_transitions
@@ -13,7 +14,7 @@ from ppievo.io import read_transitions
 class PairMSADataset(Dataset):
     def __init__(
         self,
-        pair_name: str,
+        pair_names: list[str],
         transitions_dir: str,
         vocab: Alphabet,
         max_length: int = 1022,
@@ -31,9 +32,12 @@ class PairMSADataset(Dataset):
         vocab (Alphabet): Vocabulary for encoding sequences
         """
         super(PairMSADataset, self).__init__()
-        transitions = read_transitions(
-            os.path.join(transitions_dir, pair_name + ".txt")
-        )
+        # Read transition data from all pairs
+        transitions = []
+        for pair_name in pair_names:
+            transitions.extend(
+                read_transitions(os.path.join(transitions_dir, pair_name + ".txt"))
+            )
         self.vocab = vocab
         # Tokenized unaligned sequences (i.e. no gaps)
         self.x1_toks, self.x2_toks, self.y1_toks, self.y2_toks = [], [], [], []
@@ -379,3 +383,59 @@ class PeintCollator:
         if self.return_aln_seq:
             batch.append(dec_aln_seqs)
         return batch
+
+
+class PairMSADataModule(pl.LightningDataModule):
+    """
+    Pytorch lightning data module to wrap the PairMSADataset and its loader
+    Same arguments, but also batch size, and train-val split
+    """
+
+    def __init__(
+        self,
+        pair_names: list[str],
+        transitions_dir: str,
+        vocab: Alphabet,
+        max_length: int = 1022,
+        mask_prob: float = 0.15,
+        batch_size=32,
+        train_frac=0.85,
+    ):
+        super().__init__()
+        self.pair_names = pair_names
+        self.transitions_dir = transitions_dir
+        self.max_length = max_length
+        self.vocab = vocab
+        self.batch_size = batch_size
+        self.mask_prob = mask_prob
+        self.train_frac = train_frac
+        self.val_frac = 1 - train_frac
+
+    def setup(self, stage=None):
+        self.dataset = PairMSADataset(
+            pair_names=self.pair_names,
+            transitions_dir=self.transitions_dir,
+            vocab=self.vocab,
+            max_length=self.max_length,
+        )
+        # Train val splits is random over transitions (i.e. not for holdout pairs)
+        self.train_dataset, self.val_dataset = random_split(
+            self.dataset, [self.train_frac, self.val_frac]
+        )
+        self.collate_fn = PipetCollator(vocab=self.vocab, mask_prob=self.mask_prob)
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            collate_fn=self.collate_fn,
+        )
+
+    def val_dataloader(self):
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            collate_fn=self.collate_fn,
+        )
