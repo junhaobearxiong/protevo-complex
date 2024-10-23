@@ -4,6 +4,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
+from tqdm import tqdm
 
 from esm.data import Alphabet
 from ppievo.io import read_transitions
@@ -53,7 +54,7 @@ class PairMSADataset(Dataset):
             self.x1_aln_toks, self.x2_aln_toks = [], []
             self.y1_aln_toks, self.y2_aln_toks = [], []
 
-        for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in transitions:
+        for x1_aln, y1_aln, x2_aln, y2_aln, tx, ty in tqdm(transitions):
             x1_seq_len = len(x1_aln.replace("-", ""))
             x2_seq_len = len(x2_aln.replace("-", ""))
             y1_seq_len = len(y1_aln.replace("-", ""))
@@ -425,17 +426,20 @@ class PairMSADataModule(pl.LightningDataModule):
         self.num_workers = num_workers
 
     def setup(self, stage=None):
-        self.dataset = PairMSADataset(
-            pair_names=self.pair_names,
-            transitions_dir=self.transitions_dir,
-            vocab=self.vocab,
-            max_length=self.max_length,
-        )
-        # Train val splits is random over transitions (i.e. not for holdout pairs)
-        self.train_dataset, self.val_dataset = random_split(
-            self.dataset, [self.train_frac, self.val_frac]
-        )
-        self.collate_fn = PipetCollator(vocab=self.vocab, mask_prob=self.mask_prob)
+        if stage == "fit" and not hasattr(self, "dataset"):
+            self.dataset = PairMSADataset(
+                pair_names=self.pair_names,
+                transitions_dir=self.transitions_dir,
+                vocab=self.vocab,
+                max_length=self.max_length,
+            )
+            # Create train/val split
+            self.train_dataset, self.val_dataset = random_split(
+                self.dataset,
+                [self.train_frac, self.val_frac],
+                generator=torch.Generator().manual_seed(42),  # for reproducibility
+            )
+            self.collate_fn = PipetCollator(vocab=self.vocab, mask_prob=self.mask_prob)
 
     def train_dataloader(self):
         return DataLoader(
@@ -444,6 +448,7 @@ class PairMSADataModule(pl.LightningDataModule):
             shuffle=True,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
+            persistent_workers=(self.num_workers > 0),
         )
 
     def val_dataloader(self):
@@ -453,4 +458,5 @@ class PairMSADataModule(pl.LightningDataModule):
             shuffle=False,
             collate_fn=self.collate_fn,
             num_workers=self.num_workers,
+            persistent_workers=(self.num_workers > 0),
         )

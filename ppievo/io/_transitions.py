@@ -9,7 +9,10 @@ def read_transitions(
     transitions_path: str,
 ) -> TransitionsType:
     transitions = []
-    lines = open(transitions_path, "r").read().strip().split("\n")
+    # Use context manager (with) to ensure file is closed
+    with open(transitions_path, "r") as f:
+        lines = f.read().strip().split("\n")
+
     if len(lines) == 0:
         raise Exception(f"The transitions file at {transitions_path} is empty")
     for i, line in enumerate(lines):

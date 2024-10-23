@@ -48,7 +48,7 @@ def main(args):
 
     # Dataloader removes sequences that are longer than max_length
     # Creates validation set by randomly splitting transitions from the training set
-    datamodule = PairMSADataModule(
+    dm = PairMSADataModule(
         pair_names=train_pair_names,
         transitions_dir=args.transitions_dir,
         vocab=vocab,
@@ -56,7 +56,7 @@ def main(args):
         train_frac=0.85,
         num_workers=args.num_workers,
     )
-    datamodule.setup()
+    dm.setup(stage="fit")
     print("Finished setting up datamodule")
 
     # Set up model
@@ -119,9 +119,9 @@ def main(args):
     )
 
     if args.resume_path is not None:
-        trainer.fit(model, datamodule, ckpt_path=args.resume_path)
+        trainer.fit(model, dm, ckpt_path=args.resume_path)
     else:
-        trainer.fit(model, datamodule)
+        trainer.fit(model, dm)
 
 
 if __name__ == "__main__":
@@ -183,7 +183,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=8,
+        default=0,
         help="Number of subprocesses for data loading",
     )
     parser.add_argument("--accelerator", type=str, default="gpu", help="Accelerator")

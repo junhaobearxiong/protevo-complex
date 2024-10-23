@@ -279,7 +279,7 @@ class PipetModule(pl.LightningModule):
         self.wd = kwargs.get("weight_decay", 0.0)
         self.num_warmup_steps = num_warmup_steps
         self.num_training_steps = num_training_steps
-        self.save_hyperparameters(ignore=["vocab"])
+        self.save_hyperparameters(ignore=["vocab", "esm_model"])
 
     def forward(self, enc_in, dec_in, enc_attn_mask, dec_attn_mask, distances):
         return self.model(enc_in, dec_in, enc_attn_mask, dec_attn_mask, distances)
