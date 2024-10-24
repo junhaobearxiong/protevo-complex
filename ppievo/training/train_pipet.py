@@ -54,7 +54,11 @@ def main(args):
         vocab=vocab,
         mask_prob=0.15,
         train_frac=0.85,
+        max_length=args.max_length,
+        batch_size=args.batch_size,
         num_workers=args.num_workers,
+        use_batch_sampler=True,
+        max_num_tokens=args.max_num_tokens,
     )
     dm.setup(stage="fit")
     print("Finished setting up datamodule")
@@ -143,6 +147,12 @@ if __name__ == "__main__":
         type=int,
         default=200,
         help="Number of family pairs to train on",
+    )
+    parser.add_argument(
+        "--max_num_tokens",
+        type=int,
+        default=200000,
+        help="Maximum number of tokens in batch",
     )
     parser.add_argument("--batch_size", type=int, default=32, help="Batch size")
     parser.add_argument("--lr", type=float, default=3e-4, help="Learning rate")

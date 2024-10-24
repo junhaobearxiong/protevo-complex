@@ -1,10 +1,12 @@
 import os
 import torch
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader, random_split, Sampler
 import torch.nn as nn
 import torch.nn.functional as F
 import lightning as pl
+import numpy as np
 from tqdm import tqdm
+from typing import Iterator, Optional
 
 from esm.data import Alphabet
 from ppievo.io import read_transitions
@@ -413,6 +415,8 @@ class PairMSADataModule(pl.LightningDataModule):
         batch_size: int = 32,
         train_frac: float = 0.85,
         num_workers: int = 8,
+        use_batch_sampler: bool = True,
+        max_num_tokens: int = 200000,
     ):
         super().__init__()
         self.pair_names = pair_names
@@ -424,6 +428,8 @@ class PairMSADataModule(pl.LightningDataModule):
         self.train_frac = train_frac
         self.val_frac = 1 - train_frac
         self.num_workers = num_workers
+        self.use_batch_sampler = use_batch_sampler
+        self.max_num_tokens = max_num_tokens
 
     def setup(self, stage=None):
         if stage == "fit" and not hasattr(self, "dataset"):
@@ -440,23 +446,125 @@ class PairMSADataModule(pl.LightningDataModule):
                 generator=torch.Generator().manual_seed(42),  # for reproducibility
             )
             self.collate_fn = PipetCollator(vocab=self.vocab, mask_prob=self.mask_prob)
+            if self.use_batch_sampler:
+                # Use dynamic batch size with batch sampler
+                self.train_batch_sampler = BatchSampler(
+                    dataset=self.train_dataset,
+                    max_tokens=self.max_num_tokens,
+                    shuffle=True,
+                )
+                self.val_batch_sampler = BatchSampler(
+                    dataset=self.val_dataset,
+                    max_tokens=self.max_num_tokens,
+                    shuffle=False,
+                )
 
     def train_dataloader(self):
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            collate_fn=self.collate_fn,
-            num_workers=self.num_workers,
-            persistent_workers=(self.num_workers > 0),
-        )
+        if self.use_batch_sampler:
+            return DataLoader(
+                self.train_dataset,
+                batch_sampler=self.train_batch_sampler,
+                collate_fn=self.collate_fn,
+                num_workers=self.num_workers,
+                persistent_workers=(self.num_workers > 0),
+            )
+        else:
+            return DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                collate_fn=self.collate_fn,
+                num_workers=self.num_workers,
+                persistent_workers=(self.num_workers > 0),
+            )
 
     def val_dataloader(self):
-        return DataLoader(
-            self.val_dataset,
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=self.collate_fn,
-            num_workers=self.num_workers,
-            persistent_workers=(self.num_workers > 0),
-        )
+        if self.use_batch_sampler:
+            return DataLoader(
+                self.val_dataset,
+                batch_sampler=self.val_batch_sampler,
+                collate_fn=self.collate_fn,
+            )
+        else:
+            return DataLoader(
+                self.val_dataset,
+                batch_size=self.batch_size,
+                shuffle=False,
+                collate_fn=self.collate_fn,
+                num_workers=self.num_workers,
+                persistent_workers=(self.num_workers > 0),
+            )
+
+
+class BatchSampler(Sampler):
+    """
+    BatchSampler that creates length-efficient batches while respecting max_tokens constraint.
+    Uses total sequence length (x1 + y1 + x2 + y2) as a proxy for computational cost.
+    """
+
+    def __init__(
+        self,
+        dataset: PairMSADataset,
+        max_tokens: int,
+        shuffle: bool = True,
+    ):
+        """
+        Args:
+            dataset: PairMSADataset object
+            max_tokens: Maximum total tokens per batch (encoder + decoder)
+            shuffle: Whether to shuffle batches during iteration
+            generator: Optional random number generator for reproducibility
+        """
+        # lengths: List of (x1_len, y1_len, x2_len, y2_len) for each example
+        lengths = [
+            (x1, y1, x2, y2)
+            for x1, y1, x2, y2 in zip(
+                dataset.x1_len, dataset.y1_len, dataset.x2_len, dataset.y2_len
+            )
+        ]
+        self.total_lengths = [sum(x) for x in lengths]  # Simple sum of all lengths
+        self.max_tokens = max_tokens
+        self.shuffle = shuffle
+
+        # Sort indices by length once at initialization
+        self.sorted_indices = np.argsort(self.total_lengths)
+
+        # Pre-compute batches to avoid overhead during iteration
+        self.batches = self._create_batches()
+
+    def _create_batches(self) -> list[list[int]]:
+        """Create batches based on length and max_tokens constraint."""
+        batches = []
+        current_batch = []
+        current_length = 0
+
+        # Group samples into batches
+        for idx in self.sorted_indices:
+            sample_length = self.total_lengths[idx]
+
+            # If adding this sample would exceed max_tokens, start new batch
+            if current_length + sample_length > self.max_tokens and current_batch:
+                batches.append(current_batch)
+                current_batch = [idx]
+                current_length = sample_length
+            else:
+                current_batch.append(idx)
+                current_length += sample_length
+
+        # Add the last batch if it exists
+        if current_batch:
+            batches.append(current_batch)
+
+        return batches
+
+    def __iter__(self) -> Iterator[list[int]]:
+        if self.shuffle:
+            # Shuffle batches at the start of each epoch
+            rng = torch.Generator()
+            batch_order = torch.randperm(len(self.batches), generator=rng).tolist()
+            yield from (self.batches[i] for i in batch_order)
+        else:
+            yield from self.batches
+
+    def __len__(self) -> int:
+        return len(self.batches)
