@@ -93,9 +93,10 @@ def main(args):
     lr_monitor = LearningRateMonitor(logging_interval="step")
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.output_dir,
+        save_last=True,
         save_top_k=-1,
-        every_n_train_steps=args.checkpoint_every,
-        # every_n_epochs = 2
+        every_n_epochs=args.checkpoint_every_epochs,
+        verbose=True,
     )
 
     if args.accelerator == "gpu" and len(args.devices) > 1:
@@ -139,7 +140,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/data/local_data/checkpoints/pipet/",
+        default="data/local_data/checkpoints/pipet/",
         help="Directory to save model checkpoints",
     )
     parser.add_argument(
@@ -214,10 +215,10 @@ if __name__ == "__main__":
         help="Number of batches to accumulate gradients over",
     )
     parser.add_argument(
-        "--checkpoint_every",
+        "--checkpoint_every_epochs",
         type=int,
-        default=5000,
-        help="Save checkpoint every n steps",
+        default=1,
+        help="Save checkpoint every n epoch",
     )
     parser.add_argument(
         "--check_val_every_n_epoch", type=int, default=1, help="Validate every n epochs"
